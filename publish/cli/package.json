@@ -46,6 +46,7 @@
     "@noble/curves": "2.4.0",
     "@noble/hashes": "2.4.0",
     "canonicalize": "4.0.0",
+    "cross-spawn": "7.0.6",
     "hono": "4.13.7",
     "ox": "1.7.4",
     "permissionless": "0.4.1",

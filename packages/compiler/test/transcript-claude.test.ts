@@ -138,7 +138,8 @@ describe("readConversation", () => {
     const r = readConversation(t, { maxChars: 40_000 })
 
     expect(r.text.startsWith("L3 user:")).toBe(true)
-    expect(r.text).toContain("L4 user:")
+    // UF-PROV19: a bare tool_result renders under `tool result`, never `user`
+    expect(r.text).toContain("L4 tool result:")
     expect(r.text).toContain("[REDACTED]")
     expect(r.text).not.toContain(secret)
   })
@@ -2411,5 +2412,129 @@ describe("the trail's two count lines (UF-C41C E1)", () => {
     expect(ls[1]).toBe("[… older steps not read …]")
     expect(ls[2]).toBe(`[… ${10 - kept.length} earlier steps omitted …]`)
     expect(block.length).toBeLessThanOrEqual(headerLen + 3 * rowCost + linesCost + rowCost)
+  })
+})
+
+// UF-PROV19: a hook message or a tool's output arrives as a `type:"user"`
+// record whose content is a tool_result part. Rendered under `user:` the
+// summary model credits it to the user — a real session's handoff listed a
+// PreToolUse refusal as a standing user constraint. The part lines are the
+// same [result] lines; only the heading changes, to `tool result`.
+describe("UF-PROV19 — tool output is never the user's words", () => {
+  const REFUSAL =
+    "Before the first Bash command this session, present these facts: the user request, the task state."
+  const refusalRecord = (tag: string) =>
+    JSON.stringify({
+      type: "user",
+      message: { content: [{ type: "tool_result", tool_use_id: `tu-${tag}`, content: `${REFUSAL} [${tag}]` }] },
+    })
+
+  it("a tool_result record holding a hook refusal renders under 'tool result', never 'user'", () => {
+    const dir = tmpdir()
+    const t = writeTranscript(dir, [
+      JSON.stringify({ type: "user", message: { role: "user", content: "fix the flaky login test" } }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", input: { command: "npm test" } }] } }),
+      refusalRecord("hook-refusal"),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "done" }] } }),
+    ])
+    const r = readConversation(t)
+    // the same [result] body, under a heading that does not name the user
+    expect(r.text).toContain(`L3 tool result:\n[result] ${REFUSAL} [hook-refusal]`)
+    expect(r.text).not.toContain("L3 user:")
+    // the user's real words are still user; the assistant blocks are unchanged
+    expect(r.text).toContain("L1 user:\nfix the flaky login test")
+    expect(r.text).toContain("L2 assistant:")
+    expect(r.text).toContain("L4 assistant:")
+  })
+
+  it("the same rule holds wherever the record sits — head window, tail window, unread middle", () => {
+    const dir = tmpdir()
+    const pad = (i: number) =>
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: `pad-${i} ${"p".repeat(4_000)}` }] } })
+    const lines: string[] = [
+      JSON.stringify({ type: "user", message: { role: "user", content: "port the session cache to a trie" } }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name: "Bash", input: { command: "npm test" } }] } }),
+      refusalRecord("HEAD-REFUSAL"),
+    ]
+    // ~144 KB of padding pushes past the 64 KB head window
+    for (let i = 0; i < 35; i++) lines.push(pad(i))
+    // deep inside the unread middle — the scan never renders a bare tool_result
+    lines.push(refusalRecord("MID-REFUSAL"))
+    // ~61 KB more so the middle copy stays outside the 60 KB tail window
+    for (let i = 0; i < 15; i++) lines.push(pad(100 + i))
+    lines.push(
+      JSON.stringify({ type: "user", message: { role: "user", content: "keep going" } }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "tool_use", name: "Read", input: { file_path: "src/x.mjs" } }] } }),
+      refusalRecord("TAIL-REFUSAL"),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "all done" }] } }),
+    )
+    const t = writeTranscript(dir, lines)
+    // a generous budget so every windowed block renders, not just the newest
+    const r = readConversation(t, { maxChars: 250_000 })
+    expect(r.format).toBe("claude-jsonl")
+    expect(r.text).toContain(`L3 tool result:\n[result] ${REFUSAL} [HEAD-REFUSAL]`)
+    expect(r.text).not.toContain("L3 user:")
+    expect(r.text).toMatch(/L~\d+ tool result:\n\[result\] [^\n]*TAIL-REFUSAL/)
+    expect(r.text).not.toMatch(/L~\d+ user:\n\[result\]/)
+    // the copy in the unread middle is never read, so it renders nowhere —
+    // and can never reach the model under a `user` heading either
+    expect(r.text).not.toContain("MID-REFUSAL")
+    // the typed line beside the tail's refusal is still the user's words
+    expect(r.text).toMatch(/L~\d+ user:\nkeep going/)
+  })
+
+  it("a record mixing typed text and tool results renders two blocks — words under 'user', results under 'tool result'", () => {
+    const dir = tmpdir()
+    const t = writeTranscript(dir, [
+      JSON.stringify({ type: "user", message: { role: "user", content: "wire the new flag" } }),
+      JSON.stringify({
+        type: "user",
+        message: {
+          content: [
+            { type: "tool_result", tool_use_id: "tu9", content: "stdout: all tests pass" },
+            { type: "text", text: "that output looks right, ship it" },
+          ],
+        },
+      }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "shipped" }] } }),
+    ])
+    const r = readConversation(t)
+    expect(r.text).toContain("L2 user:\nthat output looks right, ship it")
+    expect(r.text).toContain("L2 tool result:\n[result] stdout: all tests pass")
+    // the user's words come first, as the record wrote them
+    expect(r.text.indexOf("L2 user:")).toBeLessThan(r.text.indexOf("L2 tool result:"))
+  })
+
+  it("the typed message right before a tool result still renders under 'user' (PROV-17/09 regression)", () => {
+    const dir = tmpdir()
+    const t = writeTranscript(dir, [
+      JSON.stringify({ type: "user", message: { role: "user", content: "run the suite" } }),
+      refusalRecord("after-typed"),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "ok" }] } }),
+    ])
+    const r = readConversation(t)
+    expect(r.text).toContain("L1 user:\nrun the suite")
+    expect(r.text).toContain("L2 tool result:")
+    expect(r.firstUserMessage).toBe("run the suite")
+  })
+
+  it("a tool_result record that is the user's answer to the agent's question keeps 'user' for the answer mark (PROV-10)", () => {
+    const dir = tmpdir()
+    const t = writeTranscript(dir, [
+      JSON.stringify({ type: "user", message: { role: "user", content: "plan the port" } }),
+      JSON.stringify({
+        type: "user",
+        message: { content: [{ type: "tool_result", tool_use_id: "tu-q", content: "answered" }] },
+        toolUseResult: { questions: ["Name the class?"], answers: { "Name the class?": "KeyedRateLimiter" } },
+      }),
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "noted" }] } }),
+    ])
+    const r = readConversation(t)
+    // the user's choice is the user's words even though it rode in on a
+    // tool_result — the answer mark renders under `user`, the raw result under
+    // `tool result` (the line's parts are more than the answer alone)
+    expect(r.text).toContain(`L2 user:`)
+    expect(r.text).toContain("[answered the agent's question]")
+    expect(r.text).toContain("KeyedRateLimiter")
   })
 })

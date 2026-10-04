@@ -282,21 +282,15 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
     // `assistant` never joins a project, so there is no request/approve round-trip for it: the owner
     // grants its whole READ-only policy grant at init. Missing scopes only — a re-run sends nothing.
     if (identity.purposeId === "general_assistance") {
-      const missing = await missingExpectedScopes(runtime, identity.agentId, identity.purposeId)
-      if (missing.length > 0) {
-        const request = await runtime.agent(name).createAccessRequest({
-          purposeId: identity.purposeId,
-          scopes: missing.map((s) => ({ namespace: namespaceById(s.namespaceId).name, permissions: s.permissions, provenancePolicy: s.provenancePolicy })),
-          capabilityExpiresAt: BigInt(Math.floor(Date.now() / 1000) + GRANT_LIFETIME_SECONDS),
-        })
-        runtime.sendProgress(`sending ${name}'s grant`)
-        const approval = await vault.approveGrant({ accessRequest: request, manifest: identity.manifest, selection: { kind: "recommended" } })
-        const agent = runtime.agent(name)
-        await agent.completeAccessRequest(request, approval.response)
-        saveGrants(home, name, [...agent.grants])
-        // A marker left by an earlier revoke must not outlive the fresh grant init just recorded.
-        // UF-APR5 F3: a removal that fails is a note naming the retry, never a bare error.
-        removeStaleFile(runtime, name, `agents/${name}/revoked.json`)
+      // UF-APR7B R5: `mida init` takes no agent argument, so its refusal line is built with an
+      // empty name — it printed "'s request has expired… run `mida request `". Every error the
+      // assistant's grant step throws carries the name on `.agent` (the same way
+      // deploymentMismatchError carries `saved`/`builtIn`), and ownerRefusalLine reads it when
+      // the command line names nobody.
+      try {
+        await initAssistantGrant(runtime, name, identity)
+      } catch (error) {
+        throw nameOnError(error, name)
       }
     }
     agents[name] = identity.agentId
@@ -305,6 +299,141 @@ export async function init(runtime: Runtime, agentNames: readonly string[]): Pro
   // against a dry wallet and is stale now; clearing it lets the next drain pass retry at once.
   resetOutOfGasWaits(home)
   return { owner, agents }
+}
+
+/**
+ * The general-assistance grant step of init: finish any landed-but-unrecorded grant from the
+ * saved requests, then send for whatever is still missing. Own function so the caller stamps
+ * the agent's name on every error it throws (UF-APR7B R5).
+ */
+async function initAssistantGrant(runtime: Runtime, name: string, identity: NonNullable<ReturnType<typeof loadAgentIdentity>>): Promise<void> {
+  const { home, vault, reader, owner } = runtime
+  const missing = await missingExpectedScopes(runtime, identity.agentId, identity.purposeId)
+  // UF-APR7: nothing missing on the chain is only half the question — the other half is
+  // whether THIS machine finished recording the grant. An earlier init can have lost the
+  // sponsor's reply after the grant landed: every scope is live, grants.json was never
+  // written, and the assistant exists but reads nothing. The check is the same rule doctor
+  // reports: every expected scope matched to a saved, still-live capability.
+  // UF-APR7B R3: the finish pass now runs BEFORE the send whenever the coverage check fails —
+  // a grant can be live but unrecorded while OTHER scopes are still missing (a missing scope
+  // already proves the coverage check cannot pass, so the chain read is spent only when
+  // nothing is missing). The live part is finished from the saved requests first, then the
+  // send below asks for what is still missing, as today.
+  const recorded =
+    missing.length === 0 &&
+    recordedCoverage(
+      home,
+      name,
+      await liveCapabilityIdsOf(reader, owner, identity.agentId),
+      expandScopeInputs(expectedScopesFor(identity.purposeId)),
+    )
+  if (!recorded) {
+    // finishOnChainApproval sends no transaction; a throw from it reaches the caller
+    // unchanged. Every saved request is tried, newest first — a request whose reply was
+    // lost before the latest re-run may be the one whose grant landed (UF-APR7B R2), and
+    // the first that returns a grant ends the search.
+    let grant: Grant | undefined
+    for (const request of readInitGrantRequests(home, name, identity.agentId).reverse()) {
+      try {
+        grant = await finishOnChainApproval(runtime, name, identity.agentId, request, "mida init")
+      } catch (error) {
+        // UF-APR7B R5: a finish that could not RUN is not "no live grant found" — the owner
+        // must hear the approval is already on chain before the error's own line lands.
+        runtime.progress?.(`${name}'s approval is on chain, but Mida could not finish recording it. Run mida init again to finish it.`)
+        throw error
+      }
+      if (grant !== undefined) break
+    }
+    if (grant !== undefined) {
+      removeStaleFile(runtime, name, `agents/${name}/init-grant-request.json`, "mida init")
+      runtime.progress?.(`${name}'s approval was already on chain from an earlier try. Mida finished recording it on this machine (no transaction).`)
+    } else if (missing.length === 0) {
+      runtime.progress?.(`${name} is approved on chain, but this machine never finished recording that approval, so ${name} cannot read. Run mida revoke ${name}, then mida init.`)
+    }
+  }
+  if (missing.length > 0) {
+    const request = await runtime.agent(name).createAccessRequest({
+      purposeId: identity.purposeId,
+      scopes: missing.map((s) => ({ namespace: namespaceById(s.namespaceId).name, permissions: s.permissions, provenancePolicy: s.provenancePolicy })),
+      capabilityExpiresAt: BigInt(Math.floor(Date.now() / 1000) + GRANT_LIFETIME_SECONDS),
+    })
+    // UF-APR7: the request is saved BEFORE the send so a lost sponsor reply — grant landed,
+    // answer never arrived — can be finished by the next init run. The name is NOT
+    // pending-request.json on purpose: approve, approve --all and doctor read that file as a
+    // project request, and a general-assistance identity must never appear in those lists.
+    // UF-APR7B R2: the file is a LIST — append, never overwrite. An earlier request whose
+    // reply was lost may still land AFTER this re-run signs the next one, and overwriting it
+    // is what lost a landed grant to begin with; every entry stays until one is recorded.
+    const requestFile = `agents/${name}/init-grant-request.json`
+    let prior: unknown[] = []
+    try {
+      const raw = home.readJson<{ request?: unknown; requests?: unknown }>(requestFile)
+      prior = raw === undefined ? [] : [...(Array.isArray(raw.requests) ? raw.requests : []), ...(raw.request === undefined ? [] : [raw.request])]
+    } catch {
+      // a file that cannot be parsed holds nothing worth keeping
+    }
+    home.writeSecretJson(requestFile, { requests: [...prior, request] })
+    runtime.sendProgress(`sending ${name}'s grant`)
+    // UF-APR7B R4: the same landed-check approve wraps its send in. A failure after the
+    // grant transaction went out must ask the chain whether it landed before ANY line may
+    // claim nothing was sent — an unwrapped transport timeout would otherwise print
+    // chain-busy's "nothing was sent" about a grant that is already live. The retry the
+    // wrapped lines name is `mida init` — `mida approve assistant` is refused.
+    let approval: Awaited<ReturnType<typeof vault.approveGrant>>
+    try {
+      approval = await vault.approveGrant({ accessRequest: request, manifest: identity.manifest, selection: { kind: "recommended" } })
+    } catch (error) {
+      if (failedBeforeSend(error) || (error instanceof MidaError && APPROVE_REQUEST_REFUSAL_CODES.has(error.code))) throw error
+      // As in approve: if the grant did land, its readers' sends are owed work a later run
+      // must see — the marker is written before either coded refusal is thrown.
+      try {
+        markWrapsOwed(home, [
+          ...new Set<Hex>(request.scopes.filter((scope) => (scope.permissions & PERMISSION.READ) !== 0).map((scope) => scope.namespaceId)),
+        ])
+      } catch {
+        // the marker is bookkeeping; it must never mask the real failure
+      }
+      const landed = await ungrantedScopes(runtime, identity.agentId, request.scopes)
+        .then((still) => still.length === 0)
+        .catch(() => false)
+      if (landed) {
+        throw codedError(
+          "grant-landed-unfinished",
+          `the grant for ${name} landed on Monad, but Mida could not finish setting it up: ${displaySafeLine(wrapFailureReason(error), 300)} — run \`mida init\` again to finish; it sends no new grant`,
+        )
+      }
+      if (isMidaError(error, "OWNER_WALLET_LOW")) throw error
+      if (isMidaError(error, "SEND_TIMEOUT") || isMidaError(error, "SPONSOR_PENDING")) throw error
+      throw codedError(
+        "grant-unconfirmed",
+        `the grant for ${name} was sent to Monad, but Mida could not confirm it: ${displaySafeLine(wrapFailureReason(error), 300)} — run \`mida init\` again to finish; it sends nothing new if the grant landed`,
+      )
+    }
+    const agent = runtime.agent(name)
+    await agent.completeAccessRequest(request, approval.response)
+    saveGrants(home, name, [...agent.grants])
+    // A marker left by an earlier revoke must not outlive the fresh grant init just recorded.
+    // UF-APR5 F3: a removal that fails is a note naming the retry, never a bare error.
+    removeStaleFile(runtime, name, `agents/${name}/revoked.json`, "mida init")
+    removeStaleFile(runtime, name, `agents/${name}/init-grant-request.json`, "mida init")
+  }
+}
+
+/**
+ * UF-APR7B R5: `mida init` takes no agent argument, so its refusal line is built with an empty
+ * name. The agent whose step failed rides on the error's `.agent` (same convention as
+ * deploymentMismatchError's `saved`/`builtIn`) — set only when absent, so a deeper layer that
+ * already named someone is never overwritten.
+ */
+function nameOnError(error: unknown, name: string): unknown {
+  if (typeof error === "object" && error !== null && (error as { agent?: unknown }).agent === undefined) {
+    try {
+      ;(error as { agent?: string }).agent = name
+    } catch {
+      // a frozen error keeps itself — stamping must never launder the real refusal
+    }
+  }
+  return error
 }
 
 /** Spec §5B step 1: the agent asks for the policy's whole recommended grant for its purpose. The request is on disk before this returns, and so is which request is pending. */
@@ -567,6 +696,25 @@ export async function approve(
     // failed cleanup is stale by definition — the retry every removal note names must clear it.
     removeStaleFile(runtime, name, `agents/${name}/revoked.json`)
     if (cwd === undefined || identity.purposeId !== PURPOSE_ID) {
+      // UF-APR7: a general-assistance grant is init's to send and finish — when the chain approves
+      // it but this machine never recorded it (init's lost reply), "already approved" hides the
+      // only repair that works, so the refusal names it. A live-id read that fails keeps the
+      // already-approved answer exactly as before: nothing here may mask it.
+      if (identity.purposeId !== PURPOSE_ID) {
+        const ids = liveIds ?? (await liveCapabilityIdsOf(runtime.reader, runtime.owner, identity.agentId).catch(() => undefined))
+        if (ids !== undefined && !recordedCoverage(home, name, ids, covering)) {
+          // UF-APR7B R1: "run mida init" is the repair only while init still holds a request it
+          // can finish with — the same check init and doctor make. Without one the only repair
+          // left is revoke-then-init, and naming init instead would loop the owner straight
+          // back to this refusal.
+          throw codedError(
+            "assistant-grant-via-init",
+            initCanFinishGrant(home, name, identity.agentId)
+              ? `${name}'s grant is sent by mida init, not approve. Run mida init to finish recording it.`
+              : `${name} is approved on chain, but this machine never finished recording that approval, so ${name} cannot read. Run mida revoke ${name}, then mida init.`,
+          )
+        }
+      }
       throw codedError("already-approved", `agent "${name}" is already approved`)
     }
     if (confirm !== undefined && !(await confirm({ kind: "project", agent: name, projectId: marker!.projectId }))) throw notApprovedError()
@@ -947,7 +1095,7 @@ export function grantResponseFromLogs(request: AccessRequest, owner: Address, lo
  * reports the approval as unrecorded). A chain or store call that throws reaches the caller
  * as a throw: "cannot read the chain" is not "not found".
  */
-async function finishOnChainApproval(runtime: Runtime, name: string, agentId: Hex, request: AccessRequest): Promise<Grant | undefined> {
+async function finishOnChainApproval(runtime: Runtime, name: string, agentId: Hex, request: AccessRequest, retry = `mida approve ${name}`): Promise<Grant | undefined> {
   const { home, reader, owner, vault } = runtime
   // The live capabilities matching the pending request's scopes — the same records
   // ungrantedScopes asked about above, read again so each id can be named in the log scan.
@@ -1009,9 +1157,47 @@ async function finishOnChainApproval(runtime: Runtime, name: string, agentId: He
   saveGrants(home, name, [...agent.grants])
   // A marker left by an earlier revoke must not outlive a fresh approval — same as the send path.
   // UF-APR5 F3: a removal that fails here is a note naming the retry, never a bare error.
-  removeStaleFile(runtime, name, `agents/${name}/revoked.json`)
-  removeStaleFile(runtime, name, `agents/${name}/pending-request.json`)
+  // UF-APR7B R5: the retry is the caller's — init's finish of the assistant grant names
+  // `mida init`, because `mida approve assistant` is refused and would never remove them.
+  removeStaleFile(runtime, name, `agents/${name}/revoked.json`, retry)
+  removeStaleFile(runtime, name, `agents/${name}/pending-request.json`, retry)
   return grant
+}
+
+/**
+ * The requests init saved before it sent the assistant's grant (UF-APR7), read back by the
+ * re-run that finishes a landed-but-unrecorded approval, in file order — appends land last, so
+ * the newest request is at the end. Both the `{ requests: [...] }` list shape and the pre-list
+ * `{ request }` shape are read. Only requests signed for THIS identity count: a missing,
+ * unreadable or foreign file answers [], which is the pre-0.1.3 case — the owner gets the
+ * revoke-then-init line instead.
+ */
+function readInitGrantRequests(home: MidaHome, name: string, agentId: Hex): AccessRequest[] {
+  try {
+    const raw = home.readJson<{ request?: AccessRequest; requests?: AccessRequest[] }>(`agents/${name}/init-grant-request.json`)
+    const list =
+      raw === undefined ? [] : [...(Array.isArray(raw.requests) ? raw.requests : []), ...(raw.request === undefined ? [] : [raw.request])]
+    return list.filter(
+      (request): request is AccessRequest =>
+        request !== null &&
+        typeof request === "object" &&
+        typeof request.agentId === "string" &&
+        request.agentId.toLowerCase() === agentId.toLowerCase(),
+    )
+  } catch {
+    return []
+  }
+}
+
+/**
+ * UF-APR7B R1: the ONE answer approve, doctor and init must agree on — "can `mida init` finish
+ * this approval?" Only when the saved file still parses and holds at least one request signed
+ * for this identity. File existence alone proved nothing (a corrupt file or another agent's
+ * request finishes nothing), and advice built on it sent the owner round an init loop that
+ * could only end in the revoke line anyway.
+ */
+export function initCanFinishGrant(home: MidaHome, name: string, agentId: Hex): boolean {
+  return readInitGrantRequests(home, name, agentId).length > 0
 }
 
 /**
@@ -1696,16 +1882,18 @@ function wrapFailureReason(error: unknown): string {
  * UF-APR5 F3: deleting a stale file is cleanup AFTER the approval is safe — the grant is recorded
  * on disk and live on chain. A removal that fails (an EPERM on Windows) must not stop the
  * approval with a bare "refused: EPERM" that names no next step: it prints a note that says the
- * agent IS approved and names the retry, and the rest of the approval still runs. Because the
- * note's promise is `mida approve <name>`, every approve path below calls this for the same
- * removals, so the retry really does finish the cleanup.
+ * agent IS approved and names the retry, and the rest of the approval still runs. The retry is
+ * a parameter (UF-APR7B R5): approve's removals keep the default `mida approve <name>` — that
+ * command really does re-run the same cleanup — but init's own files (the saved-request file, a
+ * stale revoke marker cleared inside init) must name `mida init`, because `mida approve
+ * assistant` is refused by design and would never remove them.
  */
-function removeStaleFile(runtime: ServiceRuntime, name: string, file: string): void {
+function removeStaleFile(runtime: ServiceRuntime, name: string, file: string, retry = `mida approve ${name}`): void {
   try {
     runtime.home.remove(file)
   } catch (error) {
     runtime.progress?.(
-      `note: ${name} is approved, but Mida could not remove an old file: ${displaySafeLine(wrapFailureReason(error), 300)} — run \`mida approve ${name}\` again to finish`,
+      `note: ${name} is approved, but Mida could not remove an old file: ${displaySafeLine(wrapFailureReason(error), 300)} — run \`${retry}\` again to finish`,
     )
   }
 }

@@ -21,6 +21,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os"
 import { dirname, join, relative } from "node:path"
 import { fileURLToPath } from "node:url"
+import { npmCommand, toConfigPath } from "./build-publish-lib.mjs"
 
 const ROOT = fileURLToPath(new URL("../", import.meta.url))
 const PUBLISH = join(ROOT, "publish")
@@ -52,7 +53,7 @@ const packs = join(work, "packs")
 mkdirSync(packs, { recursive: true })
 const tarballs = []
 for (const dir of ["cli", "sdk"]) {
-  const out = spawnSync("npm", ["pack", "--pack-destination", packs], { cwd: join(PUBLISH, dir), encoding: "utf8" })
+  const out = spawnSync(npmCommand("npm"), ["pack", "--pack-destination", packs], { cwd: join(PUBLISH, dir), encoding: "utf8" })
   const file = (out.stdout ?? "").trim().split("\n").pop()
   check(out.status === 0 && file !== undefined && existsSync(join(packs, file)), `npm pack publish/${dir}`)
   if (file !== undefined) tarballs.push(join(packs, file))
@@ -62,8 +63,8 @@ for (const dir of ["cli", "sdk"]) {
 
 const project = join(work, "project")
 mkdirSync(project, { recursive: true })
-execFileSync("npm", ["init", "-y"], { cwd: project, stdio: "pipe" })
-const install = run(["npm", "install", ...tarballs, "--ignore-scripts"], { cwd: project, timeout: 300_000 })
+execFileSync(npmCommand("npm"), ["init", "-y"], { cwd: project, stdio: "pipe" })
+const install = run([npmCommand("npm"), "install", ...tarballs, "--ignore-scripts"], { cwd: project, timeout: 300_000 })
 if (install.status !== 0) {
   console.log((install.stderr ?? "") + (install.stdout ?? ""))
   console.log("npm install failed — this check needs the network for third-party dependencies;")
@@ -80,11 +81,11 @@ const env = { ...process.env, MIDA_HOME: join(work, "mida-home") }
 
 // ---------- 3. binary assertions ----------
 
-const help = run(["npx", "--no-install", "mida", "--help"], { cwd: project, env })
+const help = run([npmCommand("npx"), "--no-install", "mida", "--help"], { cwd: project, env })
 check(help.status === 0, "npx mida --help exits 0")
 check((help.stdout ?? "").includes("usage: mida init"), "--help prints the command list")
 
-const doctor = run(["npx", "--no-install", "mida", "doctor"], { cwd: project, env, timeout: 30_000 })
+const doctor = run([npmCommand("npx"), "--no-install", "mida", "doctor"], { cwd: project, env, timeout: 30_000 })
 const doctorText = `${doctor.stdout ?? ""}\n${doctor.stderr ?? ""}`
 check(
   doctorText.split("\n").some((line) => line.startsWith("ok:") || line.startsWith("PROBLEM:")),
@@ -92,7 +93,7 @@ check(
 )
 check(!/^\s+at\s/m.test(doctorText) && !doctorText.includes("node:internal"), "mida doctor prints no stack trace")
 
-const hook = run(["npx", "--no-install", "mida-hook", "claude-code"], { cwd: project, env, input: "", timeout: 2_000 })
+const hook = run([npmCommand("npx"), "--no-install", "mida-hook", "claude-code"], { cwd: project, env, input: "", timeout: 2_000 })
 check(hook.status === 0 && !hook.error, "mida-hook claude-code on empty stdin exits 0 inside 2 s")
 
 // the MCP adapter is a long-lived stdio server — what a spawn can prove is the refusal paths and
@@ -104,24 +105,24 @@ mkdirSync(env.MIDA_HOME, { recursive: true })
 writeFileSync(join(env.MIDA_HOME, "network.json"), "{}\n")
 // an empty home has no registered identity, so the launches below refuse at the gate — a wrong
 // MIDA_HOME must never start a key-less daemon in the wrong place
-const mcpBad = run(["npx", "--no-install", "mida-mcp", "--bogus"], { cwd: project, env, input: "", timeout: 10_000 })
+const mcpBad = run([npmCommand("npx"), "--no-install", "mida-mcp", "--bogus"], { cwd: project, env, input: "", timeout: 10_000 })
 check(
   mcpBad.status === 2 && (mcpBad.stderr ?? "").includes("usage: mida-mcp") && (mcpBad.stdout ?? "") === "",
   "mida-mcp --bogus exits 2 with the usage on stderr and a clean stdout",
 )
 // --as is required, and `assistant` is never a valid client identity — each client carries its
 // own (mida install <client> provisions it), so both launch forms refuse before any daemon work
-const mcpNoAs = run(["npx", "--no-install", "mida-mcp"], { cwd: project, env, input: "", timeout: 10_000 })
+const mcpNoAs = run([npmCommand("npx"), "--no-install", "mida-mcp"], { cwd: project, env, input: "", timeout: 10_000 })
 check(
   mcpNoAs.status === 2 && (mcpNoAs.stderr ?? "").includes("--as") && (mcpNoAs.stdout ?? "") === "",
   "mida-mcp without --as refuses at startup, on stderr",
 )
-const mcpAssistant = run(["npx", "--no-install", "mida-mcp", "--as", "assistant"], { cwd: project, env, input: "", timeout: 10_000 })
+const mcpAssistant = run([npmCommand("npx"), "--no-install", "mida-mcp", "--as", "assistant"], { cwd: project, env, input: "", timeout: 10_000 })
 check(
   mcpAssistant.status === 2 && (mcpAssistant.stderr ?? "").includes("general assistant") && (mcpAssistant.stdout ?? "") === "",
   "mida-mcp --as assistant refuses — a general assistant never reads project context",
 )
-const mcpEmpty = run(["npx", "--no-install", "mida-mcp", "--as", "testclient"], { cwd: project, env, input: "", timeout: 10_000 })
+const mcpEmpty = run([npmCommand("npx"), "--no-install", "mida-mcp", "--as", "testclient"], { cwd: project, env, input: "", timeout: 10_000 })
 check(
   mcpEmpty.status === 2 && (mcpEmpty.stderr ?? "").includes('no agent "testclient" is set up') && (mcpEmpty.stdout ?? "") === "",
   "mida-mcp on an empty home refuses at startup, naming the missing identity, on stderr",
@@ -131,7 +132,7 @@ writeFileSync(join(env.MIDA_HOME, "agents", "testclient", "identity.json"), "{}"
 const mcpProject = join(work, "mida-project")
 mkdirSync(join(mcpProject, ".mida"), { recursive: true })
 writeFileSync(join(mcpProject, ".mida", "project.json"), JSON.stringify({ projectId: "p1" }))
-const mcp = run(["npx", "--no-install", "mida-mcp", "--as", "testclient", "--project", mcpProject], { cwd: project, env, input: "", timeout: 10_000 })
+const mcp = run([npmCommand("npx"), "--no-install", "mida-mcp", "--as", "testclient", "--project", mcpProject], { cwd: project, env, input: "", timeout: 10_000 })
 check(mcp.status === 0 && !mcp.error, "mida-mcp starts with a registered identity and a marked project, and exits when the client closes stdio")
 
 // ---------- 4. SDK consumer: runs under node, type-checks with tsc ----------
@@ -158,7 +159,7 @@ writeFileSync(
       strict: true,
       noEmit: true,
       skipLibCheck: true,
-      typeRoots: [join(ROOT, "node_modules", "@types")],
+      typeRoots: [toConfigPath(join(ROOT, "node_modules", "@types"))],
     },
     include: ["consumer.ts"],
   }),
@@ -189,23 +190,26 @@ for (const scope of ["apps", "packages", "contracts", "scripts", "publish"]) {
 }
 
 for (const pkg of [cliDir, sdkDir]) {
-  const rel = relative(project, pkg)
-  // only the package's own files — a nested node_modules is npm's dep copies, not our ship list
-  const files = [...walk(pkg)].filter((f) => !relative(pkg, f).split("/").includes("node_modules"))
-  check(files.every((f) => !f.endsWith(".ts") || f.endsWith(".d.ts")), `${rel}: no .ts source except .d.ts`)
-  check(files.every((f) => !/(^|\/)\.env(\.|$)/.test(f)), `${rel}: no .env`)
-  check(files.every((f) => !/(^|\/)test(s)?\//.test(f)), `${rel}: no test folders`)
-  check(files.every((f) => !f.includes("brand")), `${rel}: nothing under brand/`)
+  const rel = toConfigPath(relative(project, pkg))
+  // only the package's own files — a nested node_modules is npm's dep copies, not our ship list;
+  // the rel path is forward-slashed so the segment checks below work on Windows too
+  const files = [...walk(pkg)]
+    .map((f) => ({ abs: f, rel: toConfigPath(relative(pkg, f)) }))
+    .filter((f) => !f.rel.split("/").includes("node_modules"))
+  check(files.every((f) => !f.rel.endsWith(".ts") || f.rel.endsWith(".d.ts")), `${rel}: no .ts source except .d.ts`)
+  check(files.every((f) => !/(^|\/)\.env(\.|$)/.test(f.rel)), `${rel}: no .env`)
+  check(files.every((f) => !/(^|\/)test(s)?\//.test(f.rel)), `${rel}: no test folders`)
+  check(files.every((f) => !f.rel.includes("brand")), `${rel}: nothing under brand/`)
   const alien = []
   for (const file of files) {
     let text
     try {
-      text = readFileSync(file, "utf8")
+      text = readFileSync(file.abs, "utf8")
     } catch {
       continue
     }
     for (const match of text.matchAll(/0x[0-9a-fA-F]{64}/g)) {
-      if (!sourceLiterals.has(match[0])) alien.push(`${relative(pkg, file)}: ${match[0].slice(0, 18)}…`)
+      if (!sourceLiterals.has(match[0])) alien.push(`${file.rel}: ${match[0].slice(0, 18)}…`)
     }
   }
   check(alien.length === 0, `${rel}: every 64-hex literal is a committed public constant${alien.length === 0 ? "" : ` — alien: ${alien.join(", ")}`}`)

@@ -18,6 +18,7 @@ import { FileAccessRequestStore } from "./request-store.js"
 import { listAgentNames, loadAgentIdentity, loadGrants, loadOrCreateOwnerSecrets, loadOwnerAddress, loadOwnerSecrets, loadOwnerStartBlock, saveOwnerStartBlock } from "./keys.js"
 import type { AgentIdentity } from "./keys.js"
 import { startPersistentApi } from "./api-server.js"
+import { isWindows } from "./platform.js"
 
 export interface Network {
   rpcUrl: string
@@ -204,6 +205,33 @@ const psProbe: ProcessProbe = (pid, field) => {
 }
 
 /**
+ * The Windows answer to `ps -o lstart=|command= -p <pid>`: PowerShell's Win32_Process record.
+ * The creation time is printed in UTC in round-trip form, so a lock written and read under
+ * different time zones compares equal. Output is forced to UTF-8. The pid must be a positive
+ * integer: it is placed in the PowerShell text, so anything else is refused before running.
+ */
+export const windowsProcessProbe = (run: typeof spawnSync = spawnSync): ProcessProbe => (pid, field) => {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined
+  const value = field === "lstart" ? "$p.CreationDate.ToUniversalTime().ToString('o')" : "$p.CommandLine"
+  const script = `[Console]::OutputEncoding=[Text.Encoding]::UTF8;$p=Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}';if($null -eq $p){exit 1};${value}`
+  // full path, not PATH: a desktop app started with a trimmed PATH must still find PowerShell
+  const powershell = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`
+  const out = run(powershell, ["-NoProfile", "-NonInteractive", "-Command", script], {
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 5_000,
+  })
+  if (out.error !== undefined || out.status !== 0) return undefined
+  const text = String(out.stdout ?? "").trim()
+  return text === "" ? undefined : text
+}
+
+/** The process probe for this platform: ps on Mac and Linux, PowerShell on Windows. */
+export function processProbeFor(platform: NodeJS.Platform = process.platform): ProcessProbe {
+  return isWindows(platform) ? windowsProcessProbe() : psProbe
+}
+
+/**
  * Takes the home's lock or throws. A live pid in an existing lock means another Mida process
  * holds it — the waiter retries in `stepMs` steps for up to `waitMs` before giving up, because a
  * drainer that fired during a long CLI run must not die on a transient hold. A dead, unreadable
@@ -219,7 +247,7 @@ const psProbe: ProcessProbe = (pid, field) => {
  */
 async function acquireHomeLock(home: MidaHome, waitMs: number, stepMs: number, options: { role: LockRole; ps?: ProcessProbe }): Promise<void> {
   const deadline = Date.now() + waitMs
-  const ps = options.ps ?? psProbe
+  const ps = options.ps ?? processProbeFor()
   const started = ps(process.pid, "lstart")
   const own: { pid: number; started?: string; role: LockRole } = {
     pid: process.pid,
@@ -306,8 +334,10 @@ const ENTRY_ROLES: Record<string, LockRole> = {
  * behind a runner — `vim apps/midad/src/daemon-main.ts` is an editor, not the service.
  */
 function midaRoleFromCommand(command: string): LockRole | null {
-  const tokens = command.split(/\s+/).map((token) => token.replace(/^["']+|["']+$/g, ""))
-  const base = (token: string) => token.split("/").pop()!
+  const tokens = command
+    .split(/\s+/)
+    .map((token) => token.replace(/^["']+|["']+$/g, "").replace(/\\/g, "/"))
+  const base = (token: string) => token.split("/").pop()!.replace(/\.exe$/i, "")
   if (tokens.length > 0 && MIDA_BIN_NAMES.has(base(tokens[0]!))) return ENTRY_ROLES[base(tokens[0]!)] ?? "command"
   for (let i = 0; i < tokens.length; i++) {
     if (!MIDA_RUNNERS.has(base(tokens[i]!))) continue
@@ -330,7 +360,7 @@ function midaRoleFromCommand(command: string): LockRole | null {
  * files under a service it could not see.
  */
 export function isMidaProcess(pid: number): boolean | undefined {
-  const command = psProbe(pid, "command")
+  const command = processProbeFor()(pid, "command")
   if (command === undefined) return undefined
   return midaRoleFromCommand(command) !== null
 }
@@ -386,7 +416,7 @@ export function lockHolder(home: MidaHome, ps?: ProcessProbe): LockHolder | unde
   } catch {
     return undefined
   }
-  return lockVerdict(record, ps ?? psProbe)
+  return lockVerdict(record, ps ?? processProbeFor())
 }
 
 /**

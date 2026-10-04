@@ -36,6 +36,10 @@ const GRANT_LIFETIME_SECONDS = 30 * 24 * 60 * 60
 
 const SERVICE_DOWN = "the Mida service is not answering — run any `mida` command to start it"
 
+/** Where the status line says the service listens: the socket's folder, or "a named pipe" on Windows. */
+const channelLabel = (path: string | undefined): string =>
+  path === undefined ? "no service address" : path.startsWith("\\\\.\\pipe\\") ? "a named pipe" : `socket in ${basename(dirname(path))}`
+
 /**
  * Folder-level refusal reasons → the line `mida_status` prints instead of an agent verdict —
  * reproduced verbatim; the strings are the adapter's, not this package's to reword.
@@ -416,7 +420,7 @@ export class LocalTransport implements Transport {
     const queueDepth = typeof body.queueDepth === "number" ? body.queueDepth : null
     const service = { pid, startedAt, queueDepth }
     const lines = [
-      `midad: answering — pid ${pid ?? "unknown"}, up since ${startedAt ?? "unknown"}, queue ${queueDepth ?? "unknown"} — socket in ${basename(dirname(socketPathFor(this.#home)))}`,
+      `midad: answering — pid ${pid ?? "unknown"}, up since ${startedAt ?? "unknown"}, queue ${queueDepth ?? "unknown"} — ${channelLabel(socketPathFor(this.#home))}`,
     ]
     const probe = await callDaemon(
       this.#home,

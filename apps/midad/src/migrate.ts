@@ -478,6 +478,18 @@ async function storeUnreadableManifest(
   }
 }
 
+/**
+ * UF-APR7B R5: which approve refusals migrate's approval replay may treat as "the grant already
+ * stands" rather than a real failure. A crash between the grant landing and the pending file's
+ * removal replays as no-pending-request or already-approved; for the assistant — whose grant is
+ * init's to send and record — the same landed-but-unrecorded state answers
+ * assistant-grant-via-init instead, because `mida approve assistant` is refused by design.
+ * Anything else stays a real refusal and propagates.
+ */
+export function migrateToleratesApprovalRefusal(name: string, code: unknown): boolean {
+  return code === "no-pending-request" || code === "already-approved" || (name === "assistant" && code === "assistant-grant-via-init")
+}
+
 export async function migrate(
   deps: MigrateDeps,
 ): Promise<{ outcome: "moved" | "refused" | "nothing-to-move"; code?: string; lines: string[] }> {
@@ -757,7 +769,9 @@ export async function migrate(
 
     // ── Rule 3: backed-up ──────────────────────────────────────────────────────
     if (!reached("backed-up")) {
-      const backup = `migrate/backup-${migratedAt}`
+      // a Windows filename may not hold ":", so the folder swaps each for "-"; `migratedAt`
+      // itself stays ISO wherever it is data (state.json, envelopes, network.json.previous)
+      const backup = `migrate/backup-${migratedAt.replace(/:/g, "-")}`
       for (const item of ["network.json", "agents", "approved-projects.json", "state", "data"]) {
         if (home.has(item)) copyInto(home, item, `${backup}/${item}`)
       }
@@ -974,7 +988,7 @@ export async function migrate(
                 }
               }
               const code = (error as { code?: unknown }).code
-              if ((code !== "no-pending-request" && code !== "already-approved") || stillMissing.length > 0) throw error
+              if (!migrateToleratesApprovalRefusal(name, code) || stillMissing.length > 0) throw error
               stagingHome.remove(`agents/${name}/pending-request.json`)
             }
           }
@@ -1444,7 +1458,7 @@ export async function migrate(
 
       // The kept manifest: no HMAC key (it never had one — the key lived in state.json) and no
       // plaintext, just every entry's identity, fingerprint and origin.
-      const manifestPath = `migrate/manifest-${migratedAt}.json`
+      const manifestPath = `migrate/manifest-${migratedAt.replace(/:/g, "-")}.json`
       home.writeSecretJson(manifestPath, manifest)
 
       // The staging identities replace the local agents, then per-agent residue goes: stale
@@ -1517,7 +1531,7 @@ export interface MigrateUndoDeps {
 }
 
 /**
- * `mida migrate --undo` (spec §5.4 step 7): restores the newest `migrate/backup-<ISO>` over the
+ * `mida migrate --undo` (spec §5.4 step 7): restores the newest `migrate/backup-*` over the
  * live files. The old contract is never written to, so the restored setup simply works again.
  * Three extras keep it honest: the service is stopped first (the same dance the pause step
  * does), every source-revoked agent is revoked on the TARGET too — idempotent, by agent id —
@@ -1539,7 +1553,14 @@ export async function migrateUndo(deps: MigrateUndoDeps): Promise<{ outcome: "re
   const backups = home
     .list("migrate")
     .filter((name) => name.startsWith("backup-"))
-    .sort()
+    // Backups written before the Windows port carry the ISO ":" in their name; newer names swap
+    // it for "-". ":" sorts after "-", so ordering raw names takes an older ":" backup as the
+    // newest. Comparing each name with ":" swapped orders both shapes by the stamp they carry.
+    .sort((a, b) => {
+      const ka = a.replace(/:/g, "-")
+      const kb = b.replace(/:/g, "-")
+      return ka < kb ? -1 : ka > kb ? 1 : 0
+    })
   const newest = backups.at(-1)
   if (newest === undefined) {
     return refuse("there is no migration backup to restore — nothing was moved back")

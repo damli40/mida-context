@@ -1,7 +1,7 @@
 import { accessSync, constants, existsSync, mkdtempSync, readFileSync } from "node:fs"
 import { homedir, tmpdir } from "node:os"
-import { dirname, isAbsolute, join } from "node:path"
-import { spawn } from "node:child_process"
+import { dirname, isAbsolute, join, win32 } from "node:path"
+import crossSpawn from "cross-spawn"
 import { createPublicClient, http } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
 import { decodeUint64, displaySafeLine, isMidaError } from "@mida/protocol"
@@ -9,7 +9,7 @@ import type { Address, Hex } from "@mida/protocol"
 import { chainFor, rpcTransport } from "@mida/chain"
 import type { ChainContext } from "@mida/chain"
 import { REQUEST_LIFETIME_SECONDS } from "@mida/sdk"
-import { COMPILE_PROVIDERS, devinSqliteAvailable } from "@mida/compiler"
+import { COMPILE_PROVIDERS, devinSqliteAvailable, killProcessTree, resolveBinary } from "@mida/compiler"
 import type { SummarizerEntry } from "@mida/compiler"
 import { ContextApiClient, DenyOverlay, RegistryReader, StoreHttpError } from "@mida/api"
 import type { RevocationTarget } from "@mida/api"
@@ -24,11 +24,11 @@ import { DEVIN_NODE_SQLITE_MIN } from "./devin-facts.js"
 import { drainerEnv } from "./hook.js"
 import { SUMMARY_FAILURE_REASONS, sessionWaits } from "./drain.js"
 import { currentSummarizer } from "./summarizer.js"
-import { CODEX_TRUST_SENTENCE, claudeCodeMcpStatus, claudeDesktopConfigPath, claudeHooksStatus, claudeUserConfigPath, codexHooksStatus, codexMcpStatus, cursorMcpConfigPath, devinHooksStatus, installedMcpLauncherPath, macosProtectedFolderNote, midaCommandsInClaudeSettings, midaCommandsInCodexConfig, midaCommandsInDevinConfig, parseMidaCommand } from "./install.js"
+import { CODEX_TRUST_SENTENCE, claudeCodeMcpStatus, claudeDesktopConfigPaths, claudeHooksStatus, claudeUserConfigPath, codexHooksStatus, codexMcpStatus, cursorMcpConfigPath, devinHooksStatus, fileName, installedMcpLauncherPath, macosProtectedFolderNote, midaCommandsInClaudeSettings, midaCommandsInCodexConfig, midaCommandsInDevinConfig, parseMidaCommand } from "./install.js"
 import type { InstallTool, McpClientTool } from "./install.js"
 import { isRevoked, listAgentNames, loadAgentIdentity, loadGrants, loadOwnerAddress, loadOwnerMode, loadOwnerPublicKey } from "./keys.js"
 import { expandScopeInputs } from "@mida/grant-advisor"
-import { expectedScopesFor, liveCapabilityIdsOf, recordedCoverage } from "./skeleton.js"
+import { expectedScopesFor, initCanFinishGrant, liveCapabilityIdsOf, recordedCoverage } from "./skeleton.js"
 import type { OwnerMode } from "./keys.js"
 import { approvalsFileStatus, readApprovalsFile } from "./projects.js"
 import { listJobs } from "./queue.js"
@@ -37,6 +37,7 @@ import type { ProcessProbe } from "./runtime.js"
 import { mismatchLine, readSavedNetwork, resolveNetwork } from "./network.js"
 import type { ResolvedNetwork, SavedNetwork, ServiceSource } from "./network.js"
 import { cliPackageName, isBundled, siblingEntryArgs, siblingEntryPath } from "./sibling.js"
+import { isWindows, serviceStopCommand } from "./platform.js"
 import { folderTaskFor } from "./task.js"
 
 /** The whole run is capped — a check may stall, the report may not. */
@@ -67,6 +68,13 @@ export interface DoctorDeps {
   /** The account home and OS platform the protected-folder note is judged on — tests inject both. */
   homeDir?: string
   platform?: NodeJS.Platform
+  /**
+   * The Mida home's location for the Windows outside-the-user-folder note; default home.root.
+   * A test injects a Windows path a Mac cannot create.
+   */
+  homeRoot?: string
+  /** The account's profile folder that note measures against; default USERPROFILE, then homedir(). */
+  userProfile?: string
   /** Where Cursor's `.cursor/mcp.json` is looked for; default process.cwd(). */
   cwd?: string
   /** Shell environment for the API-key check; default process.env. Values are never printed. */
@@ -342,6 +350,7 @@ const ENV_VARS = [
   "MIDA_CLAUDE_SETTINGS",
   "MIDA_CODEX_CONFIG",
   "MIDA_INNER",
+  "MIDA_CAPTURE_HEADLESS",
   "MIDA_E2E_MONAD_TESTNET",
   "DEEPSEEK_API_KEY",
   "DEEPSEEK_BASE_URL",
@@ -358,8 +367,13 @@ const ENV_VARS = [
   "VAULT_RP_ID",
 ] as const
 
-/** Is the file executable? The bundled hook bins are chmod 0755 at build time; anything less means a dead hook. */
-function isExecutable(file: string): boolean {
+/**
+ * Is the file executable? The bundled hook bins are chmod 0755 at build time; anything less
+ * means a dead hook. Windows has no execute bit: an existing file runs, so existence is the
+ * whole check there.
+ */
+function isExecutable(file: string, platform: NodeJS.Platform = process.platform): boolean {
+  if (isWindows(platform)) return existsSync(file)
   try {
     accessSync(file, constants.X_OK)
     return true
@@ -374,18 +388,28 @@ function isExecutable(file: string): boolean {
  * reported here — the "outdated" status line already names that fix. The path in the FILE is
  * checked, never PATH — that is the contract the absolute-path install bought (R5-7).
  */
-function hookPathProblems(commands: string[] | "absent" | "unreadable", tool: InstallTool): string[] {
+function hookPathProblems(commands: string[] | "absent" | "unreadable", tool: InstallTool, platform: NodeJS.Platform = process.platform): string[] {
   if (!Array.isArray(commands)) return []
   const problems = new Set<string>()
   const reinstall = `run \`mida install ${tool}\``
+  // the tools whose hooks a bare `node`/`node.exe` program can serve. The moved-Node line is
+  // written for them; any other tool keeps the plain missing-path report
+  const displayName = tool === "claude-code" ? "Claude Code" : tool === "codex" ? "Codex" : undefined
   for (const command of commands) {
     const parsed = parseMidaCommand(command)
     if (parsed === null) continue
-    for (const target of parsed.paths) {
-      if (!isAbsolute(target.file)) continue
+    for (const [index, target] of parsed.paths.entries()) {
+      // a Windows path read on a Mac test is still absolute; the same rule the parser applies
+      if (!(isAbsolute(target.file) || win32.isAbsolute(target.file))) continue
       if (!existsSync(target.file)) {
-        problems.add(problem(`a ${tool} hook points at ${target.file}, which does not exist`, reinstall))
-      } else if (target.executable && !isExecutable(target.file)) {
+        // a moved or reinstalled Node leaves every hook pointing at a program that is gone
+        // (Review Focus 3): the fix is the install that writes the new path, named plainly
+        if (index === 0 && target.executable && /^node(\.exe)?$/i.test(fileName(target.file)) && displayName !== undefined) {
+          problems.add(problem(`the ${displayName} hooks run ${target.file}, which is gone (Node was moved or reinstalled)`, `run mida install ${tool} again`))
+        } else {
+          problems.add(problem(`a ${tool} hook points at ${target.file}, which does not exist`, reinstall))
+        }
+      } else if (target.executable && !isExecutable(target.file, platform)) {
         problems.add(problem(`a ${tool} hook points at ${target.file}, which is not executable`, reinstall))
       }
     }
@@ -561,7 +585,7 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
           if (holder !== undefined && holder.kind === "held") {
             if (holder.role === "service") {
               return [
-                `PROBLEM: the Mida service (pid ${holder.pid}) is running but has not answered for 5 s. If mida doctor still says this in a minute, stop it with kill ${holder.pid}, then open any agent session or run mida task to start a fresh one.`,
+                `PROBLEM: the Mida service (pid ${holder.pid}) is running but has not answered for 5 s. If mida doctor still says this in a minute, stop it with ${serviceStopCommand(String(holder.pid), deps.platform)}, then open any agent session or run mida task to start a fresh one.`,
               ]
             }
             if (holder.role === "save-helper") {
@@ -607,6 +631,23 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
           lines.push(problem(`midad runs ${codeRoot} @ ${codeCommit.slice(0, 7)}; this command runs ${self.codeRoot} @ ${self.codeCommit.slice(0, 7)}`, "run any mida command to replace it"))
         }
         return lines
+      },
+    },
+    {
+      name: "home",
+      run: async () => {
+        // Windows only: the default Mida home sits inside %USERPROFILE%, where the folder's ACL
+        // grants the owner, SYSTEM and Administrators. A MIDA_HOME placed anywhere else is
+        // judged by permissions doctor cannot read. Say so plainly rather than vouch for them.
+        if (!isWindows(deps.platform ?? process.platform)) return []
+        const userProfile = deps.userProfile ?? process.env.USERPROFILE ?? homedir()
+        const homeRoot = deps.homeRoot ?? home.root
+        const rel = win32.relative(userProfile, homeRoot)
+        const outside = rel === ".." || rel.startsWith("..\\") || win32.isAbsolute(rel)
+        if (!outside) return []
+        return [
+          `note: Mida's folder ${homeRoot} is outside your user folder, so Mida cannot vouch for who can read it. Move it under ${userProfile} or unset MIDA_HOME.`,
+        ]
       },
     },
     {
@@ -726,13 +767,18 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
             )
             if (!covered) {
               // assistant's grant is sent by `mida init` and `mida approve assistant` is refused,
-              // so its repair is revoke-then-init; a passkey home has no local owner key for
-              // approve to sign with, so its repair walks through request again.
+              // so its repair is revoke-then-init — UF-APR7: unless init's saved request is still
+              // usable (UF-APR7B R1: the file must parse and hold a request for THIS identity —
+              // existence alone is not enough), in which case a plain `mida init` re-run finishes
+              // the recording. A passkey home has no local owner key for approve to sign with, so
+              // its repair walks through request again.
               lines.push(
                 ownerModeOf(home) === "passkey"
                   ? `PROBLEM: ${name} is approved on chain, but this machine never finished recording that approval, so ${name} cannot read or save. To repair it: mida revoke ${name}, then mida request ${name}, then mida approve ${name}.`
                   : name === "assistant"
-                    ? `PROBLEM: assistant is approved on chain, but this machine never finished recording that approval, so assistant cannot read. Run mida revoke assistant, then mida init.`
+                    ? initCanFinishGrant(home, name, identity!.agentId)
+                      ? `PROBLEM: assistant is approved on chain, but this machine never finished recording that approval, so assistant cannot read. Run mida init to finish it.`
+                      : `PROBLEM: assistant is approved on chain, but this machine never finished recording that approval, so assistant cannot read. Run mida revoke assistant, then mida init.`
                     : `PROBLEM: ${name} is approved on chain, but this machine never finished recording that approval, so ${name} cannot read or save. Run mida approve ${name} to finish it.`,
               )
             } else {
@@ -905,7 +951,7 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
             return problem(`the ${entry} binary is missing at ${missing[0]}`, hookCommandFix())
           }
           const file = siblingEntryPath(entry)
-          if (isBundled() && !isExecutable(file)) {
+          if (isBundled() && !isExecutable(file, deps.platform ?? process.platform)) {
             return problem(`the ${entry} binary at ${file} is not executable`, hookCommandFix())
           }
           return `ok: ${entry} resolves to ${file}`
@@ -919,6 +965,7 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
         // MIDA_CLAUDE_SETTINGS / MIDA_CODEX_CONFIG let a run that uses throwaway settings files
         // point the check at them — without it the check would report two false problems (R4-6).
         const env = deps.env ?? process.env
+        const platform = deps.platform ?? process.platform
         const claudePath = deps.settings?.["claude-code"] ?? env.MIDA_CLAUDE_SETTINGS
         if (claudePath !== undefined) {
           const status = claudeHooksStatus(claudePath)
@@ -934,7 +981,7 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
           // "installed" only proves the text matches — the path inside it is what runs, so it
           // is stat'ed too; an "outdated" file may be a moved checkout's paths, worth the same stat (R5-7)
           if (status === "installed" || status === "outdated") {
-            lines.push(...hookPathProblems(midaCommandsInClaudeSettings(claudePath), "claude-code"))
+            lines.push(...hookPathProblems(midaCommandsInClaudeSettings(claudePath), "claude-code", platform))
           }
           // in-28: a tool with hooks installed also reports whether install's MCP half ran —
           // an older or --no-mcp install has the hooks without the server, and the note
@@ -965,7 +1012,7 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
                   : problem("codex hooks are not installed", "run `mida install codex`"),
           )
           if (status === "installed" || status === "outdated") {
-            lines.push(...hookPathProblems(midaCommandsInCodexConfig(codexPath), "codex"))
+            lines.push(...hookPathProblems(midaCommandsInCodexConfig(codexPath), "codex", platform))
           }
           // in-28: the same "did install's MCP half run" line — a hooks-only block (from a
           // --no-mcp install or an older build) reports the note, the managed table the ok
@@ -997,7 +1044,7 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
                   : problem("devin hooks are not installed", "run `mida install devin`"),
           )
           if (status === "installed" || status === "outdated") {
-            lines.push(...hookPathProblems(midaCommandsInDevinConfig(devinPath), "devin"))
+            lines.push(...hookPathProblems(midaCommandsInDevinConfig(devinPath), "devin", platform))
           }
           if (status === "installed") {
             // this build does not know where Devin keeps MCP servers, so the note is all the
@@ -1022,8 +1069,12 @@ function buildChecks(deps: DoctorDeps, shared: Shared): { name: string; run(): P
       run: async () => {
         const homeDir = deps.homeDir ?? homedir()
         const platform = deps.platform ?? process.platform
+        const desktopPaths =
+          deps.mcpConfigs?.["claude-desktop"] !== undefined
+            ? [deps.mcpConfigs["claude-desktop"]]
+            : claudeDesktopConfigPaths(homeDir, deps.env, platform)
         const entries: [McpClientTool, string][] = [
-          ["claude-desktop", deps.mcpConfigs?.["claude-desktop"] ?? claudeDesktopConfigPath(homeDir)],
+          ...desktopPaths.map((path): [McpClientTool, string] => ["claude-desktop", path]),
           ["cursor", deps.mcpConfigs?.cursor ?? cursorMcpConfigPath(deps.cwd ?? process.cwd())],
         ]
         const lines: string[] = []
@@ -1573,19 +1624,33 @@ export async function runDoctorLive(tool: InstallTool, deps: DoctorLiveDeps): Pr
 /**
  * The throwaway session: a headless one-shot prompt in an empty folder — just enough for the
  * tool to start, fire SessionStart and exit. `claude -p` and `codex exec` are the headless forms.
+ * The tool resolves on PATH only: cross-spawn looks a bare name up in the current folder first
+ * on Windows, and a claude.cmd planted there would run instead. An unresolved name starts
+ * nothing. The watch then times out exactly as a binary that errored at spawn does.
  */
-function startToolSession(tool: InstallTool, cwd: string): { stop(): void } {
-  const [command, args] =
-    tool === "claude-code" ? ["claude", ["-p", "Reply with the word ok."]] : ["codex", ["exec", "Reply with the word ok."]]
+export function startToolSession(
+  tool: InstallTool,
+  cwd: string,
+  deps: { spawn?: typeof crossSpawn; env?: NodeJS.ProcessEnv } = {},
+): { stop(): void } {
+  const env = deps.env ?? process.env
+  const name = tool === "claude-code" ? "claude" : "codex"
+  const binary = resolveBinary(name, env.PATH)
+  if (binary === undefined) return { stop() {} }
+  const args = tool === "claude-code" ? ["-p", "Reply with the word ok."] : ["exec", "Reply with the word ok."]
   // A model child gets the same environment rule as the drainer: no ANTHROPIC_* name crosses over.
-  const child = spawn(command, args, { cwd, stdio: "ignore", env: drainerEnv(process.env) })
+  const child = (deps.spawn ?? crossSpawn)(binary, args, { cwd, stdio: "ignore", env: drainerEnv(env), windowsHide: true })
   child.on("error", () => {})
   return {
     stop() {
       try {
-        child.kill()
+        if (child.pid !== undefined) killProcessTree(child.pid)
       } catch {
-        // already gone
+        try {
+          child.kill()
+        } catch {
+          // already gone
+        }
       }
     },
   }

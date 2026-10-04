@@ -1,0 +1,25 @@
+# >>> mida hooks — managed by `mida install codex`; do not edit >>>
+[mcp_servers.mida]
+command = "<ROOT>/bin/mida-mcp"
+args = ["--as", "codex"]
+env = { MIDA_HOME = "/h/.mida" }
+
+[[hooks.SessionStart]]
+matcher = "startup|resume|clear|compact"
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "<NODE> --import <ROOT>/node_modules/tsx/dist/loader.mjs <ROOT>/apps/midad/src/inject-main.ts codex"
+
+[[hooks.UserPromptSubmit]]
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "<NODE> --import <ROOT>/node_modules/tsx/dist/loader.mjs <ROOT>/apps/midad/src/inject-main.ts codex"
+
+[[hooks.Stop]]
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = "<NODE> --import <ROOT>/node_modules/tsx/dist/loader.mjs <ROOT>/apps/midad/src/hook-main.ts codex"
+# <<< mida hooks <<<

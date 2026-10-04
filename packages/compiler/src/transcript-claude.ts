@@ -608,10 +608,21 @@ function toolResultText(content: unknown): string {
 // Render one user/assistant line as "L<label> <role>:\n<parts>" — the label
 // is the real line number, or "~<n>" for a tail line whose absolute number is
 // unknowable. Returns null when the message renders to nothing (empty content).
-function renderMessage(label: string, obj: TranscriptLine): string | null {
+//
+// UF-PROV19: Claude Code stores a tool's result (and hook output, like a
+// PreToolUse refusal) as a `type:"user"` record whose content is a tool_result
+// part — rendered under `user:` the summary model credits it to the user. A
+// user record's tool_result parts render under the `tool result` heading
+// instead, so a results-only record produces `L<label> tool result:` and a
+// record mixing typed text and results produces two blocks: the text under
+// `user`, the results under `tool result`. Assistant records are unchanged —
+// every part stays under `assistant`. `extraUserLines` are rendered inside the
+// user block (the caller's typed-answer mark, which IS the user's words).
+function renderMessage(label: string, obj: TranscriptLine, extraUserLines: string[] = []): string | null {
   const content = obj.message?.content
   const isUser = obj.type === "user"
   const parts: string[] = []
+  const results: string[] = [] // a user record's tool_result parts, under their own heading
   // a user text keeps its words after a leading injected block — the reminder
   // goes, the ask stays; a part that was all scaffolding contributes nothing
   const pushText = (text: string) => {
@@ -642,16 +653,23 @@ function renderMessage(label: string, obj: TranscriptLine): string | null {
         }
         parts.push(`[tool ${String(p.name ?? "?")}] ${cut(input, PART_CHARS)}`)
       } else if (p.type === "tool_result") {
-        parts.push(`[result] ${cut(toolResultText(scrubValue(p.content)), PART_CHARS)}`)
+        ;(isUser ? results : parts).push(`[result] ${cut(toolResultText(scrubValue(p.content)), PART_CHARS)}`)
       }
     }
   }
-  const body = parts
-    .map((p) => scrubSecrets(p))
-    .filter((p) => p.length)
-    .join("\n")
-  if (!body) return null
-  return `L${label} ${obj.type}:\n${body}`
+  parts.push(...extraUserLines)
+  const body = (lines: string[]) =>
+    lines
+      .map((p) => scrubSecrets(p))
+      .filter((p) => p.length)
+      .join("\n")
+  const userBody = body(parts)
+  const resultBody = body(results)
+  if (!userBody && !resultBody) return null
+  const blocks: string[] = []
+  if (userBody) blocks.push(`L${label} ${obj.type}:\n${userBody}`)
+  if (resultBody) blocks.push(`L${label} tool result:\n${resultBody}`)
+  return blocks.join("\n\n")
 }
 
 export function readConversation(
@@ -819,7 +837,7 @@ export function readConversation(
           : answerText !== null
             ? answerOnly
               ? `L${label} user:\n${answerText}`
-              : `${renderMessage(label, obj) ?? `L${label} user:`}\n${answerText}`
+              : renderMessage(label, obj, [answerText])
             : renderMessage(label, obj)
     if (block) {
       const typed = isUser ? (claudeTypedUserText(obj, neighbourLocalCommand(i)) ?? answer) : null

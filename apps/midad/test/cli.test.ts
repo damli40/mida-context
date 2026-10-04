@@ -245,6 +245,29 @@ describe("the crude mida command", () => {
     expect(lines.some((line) => line.startsWith("approved claude-desktop"))).toBe(true)
   }, 300_000)
 
+  it("install claude-desktop on Windows writes every Claude config file, one result line each", async () => {
+    const lines: string[] = []
+    const work = mkdtempSync(join(tmpdir(), "mida-desktop-work-"))
+    mkdirSync(join(work, ".mida"))
+    writeFileSync(join(work, ".mida", "project.json"), JSON.stringify({ projectId: "p-desktop" }))
+    const first = join(mkdtempSync(join(tmpdir(), "mida-desktop-cfg-")), "claude_desktop_config.json")
+    const second = join(mkdtempSync(join(tmpdir(), "mida-desktop-cfg-")), "claude_desktop_config.json")
+    const run2 = (...argv: string[]) =>
+      runCli(argv, {
+        home, network, print: (line) => lines.push(line),
+        prompt: async () => "yes", stdinIsTTY: true, stdoutIsTTY: true,
+        cwd: work, platform: "win32", claudeDesktopConfigs: [first, second],
+      })
+    expect(await run2("install", "claude-desktop")).toBe(0)
+    for (const file of [first, second]) {
+      const entry = JSON.parse(readFileSync(file, "utf8")).mcpServers["mida-claude-desktop"]
+      expect(entry.command).toBe(process.execPath)
+      expect(entry.args.slice(-4)).toEqual(["--as", "claude-desktop", "--project", work])
+      expect(entry.env).toEqual({ MIDA_HOME: home.root })
+      expect(lines).toContain(`installed (${file})`)
+    }
+  }, 300_000)
+
   it("install cursor writes <cwd>/.cursor/mcp.json with ${workspaceFolder} and its own identity (I1)", async () => {
     const lines: string[] = []
     const work = mkdtempSync(join(tmpdir(), "mida-cursor-work-"))

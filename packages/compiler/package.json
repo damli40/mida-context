@@ -5,6 +5,7 @@
   "type": "module",
   "exports": { ".": "./src/index.ts" },
   "dependencies": {
-    "@mida/checkpoint": "workspace:*"
+    "@mida/checkpoint": "workspace:*",
+    "cross-spawn": "7.0.6"
   }
 }

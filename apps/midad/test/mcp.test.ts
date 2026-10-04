@@ -82,7 +82,7 @@ const fakeDaemon = (dir: MidaHome, routes: Record<string, Route>) =>
       })
     })
     s.once("error", rej)
-    s.listen(socketPathFor(dir), () =>
+    s.listen(socketPathFor(dir)!, () =>
       res({
         requests,
         stop: () =>

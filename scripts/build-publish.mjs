@@ -18,6 +18,7 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSyn
 import { tmpdir } from "node:os"
 import { dirname, join, relative } from "node:path"
 import { fileURLToPath } from "node:url"
+import { toConfigPath } from "./build-publish-lib.mjs"
 
 const ROOT = fileURLToPath(new URL("../", import.meta.url))
 const PUBLISH = join(ROOT, "publish")
@@ -116,7 +117,13 @@ buildSync({
   banner: { js: "#!/usr/bin/env node" },
   logLevel: "info",
 })
-for (const file of readdirSync(cliDist).filter((f) => f.endsWith(".js"))) chmodSync(join(cliDist, file), 0o755)
+// npm links each bin executable itself at install time, so this is a courtesy for direct use of
+// the tarball contents — and a no-op POSIX mode must never fail the build on Windows
+for (const file of readdirSync(cliDist).filter((f) => f.endsWith(".js"))) {
+  try {
+    chmodSync(join(cliDist, file), 0o755)
+  } catch {}
+}
 // The checkpoint compiler spawns these scripts by path relative to its own module —
 // openai-compatible-model.mjs is the real call; kimi-model.mjs is the compat shim that execs
 // it. Both ship byte-for-byte beside the bundles.
@@ -150,17 +157,17 @@ const tsconfig = join(emitDir, "tsconfig.json")
 writeFileSync(
   tsconfig,
   JSON.stringify({
-    extends: join(ROOT, "tsconfig.json"),
+    extends: toConfigPath(join(ROOT, "tsconfig.json")),
     compilerOptions: {
       noEmit: false,
       declaration: true,
       emitDeclarationOnly: true,
-      rootDir: ROOT,
-      outDir: emitDir,
+      rootDir: toConfigPath(ROOT),
+      outDir: toConfigPath(emitDir),
       // typeRoots defaults to a walk up from THIS file — a temp dir finds no @types, so pin it
-      typeRoots: [join(ROOT, "node_modules", "@types")],
+      typeRoots: [toConfigPath(join(ROOT, "node_modules", "@types"))],
     },
-    include: sdkPkgs.flatMap((name) => [join(workspacePackages().get(name).dir, "src", "**", "*.ts")]),
+    include: sdkPkgs.flatMap((name) => [toConfigPath(join(workspacePackages().get(name).dir, "src", "**", "*.ts"))]),
   }),
 )
 execFileSync(process.execPath, [join(ROOT, "node_modules", "typescript", "bin", "tsc"), "-p", tsconfig], { stdio: "inherit" })
@@ -177,7 +184,7 @@ function* walk(dir) {
 for (const emitted of walk(emitDir)) {
   if (!emitted.endsWith(".d.ts")) continue
   // emitDir mirrors the repo: <packages|apps>/<dir>/src/<rest>.d.ts → dist/types/<pkg>/<rest>.d.ts
-  const rel = relative(emitDir, emitted)
+  const rel = toConfigPath(relative(emitDir, emitted))
   const match = rel.match(/^(?:packages|apps)\/([^/]+)\/src\/(.+)$/)
   if (match === null) throw new Error(`unexpected emitted declaration path ${rel}`)
   const [, pkgDir, rest] = match

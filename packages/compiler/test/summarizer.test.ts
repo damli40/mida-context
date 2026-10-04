@@ -3,7 +3,7 @@
 // probe, and resolveSummarizer's order of decision — saved key, saved agents,
 // environment, agents-unchosen.
 
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -143,6 +143,38 @@ describe("resolveBinary", () => {
   })
 })
 
+describe("resolveBinary on Windows (Review Focus 4)", () => {
+  const made: string[] = []
+  afterAll(() => made.forEach((dir) => fs.rmSync(dir, { recursive: true, force: true })))
+  const folderWith = (...names: string[]) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "rb-"))
+    made.push(dir)
+    for (const name of names) fs.writeFileSync(path.join(dir, name), "")
+    return dir
+  }
+
+  it("finds an npm launcher (claude.cmd)", () => {
+    const dir = folderWith("claude.cmd")
+    expect(resolveBinary("claude", dir, "win32", ".COM;.EXE;.BAT;.CMD")).toBe(path.join(dir, "claude.cmd"))
+  })
+
+  it("finds a native install (claude.exe) and prefers it over a .cmd in the same folder", () => {
+    const dir = folderWith("claude.cmd", "claude.exe")
+    expect(resolveBinary("claude", dir, "win32", ".COM;.EXE;.BAT;.CMD")).toBe(path.join(dir, "claude.exe"))
+  })
+
+  it("splits PATH on ; and follows its order", () => {
+    const first = folderWith("codex.cmd")
+    const second = folderWith("codex.exe")
+    expect(resolveBinary("codex", `${first};${second}`, "win32", ".EXE;.CMD")).toBe(path.join(first, "codex.cmd"))
+  })
+
+  it("Mac behaviour is unchanged: no extension guessing", () => {
+    const dir = folderWith("claude.cmd")
+    expect(resolveBinary("claude", dir, "darwin")).toBeUndefined()
+  })
+})
+
 describe("probeClaudeSafeMode", () => {
   let dir: string
   let binary: string
@@ -229,6 +261,32 @@ describe("probeClaudeSafeMode", () => {
     expect(await probeClaudeSafeMode(binary, run)).toBe(true)
     expect(calls).toBe(2)
   })
+
+  it("a binary that ignores SIGTERM is still gone after the timed-out probe resolves", async () => {
+    // The real run: killProcessTree's kill(-pid) fails when the child is not a group leader,
+    // and the fallback must hit hard. The old execFile timeout killed outright too.
+    const pidFile = path.join(dir, "pid")
+    fs.writeFileSync(binary, `#!/bin/sh\ntrap '' TERM\necho $$ > "${pidFile}"\nexec sleep 60\n`)
+    fs.chmodSync(binary, 0o755)
+    const answer = await probeClaudeSafeMode(binary)
+    expect(answer).toBe(false)
+    const pid = Number(fs.readFileSync(pidFile, "utf8"))
+    let alive = true
+    for (let i = 0; i < 100 && alive; i++) {
+      try {
+        process.kill(pid, 0)
+      } catch {
+        alive = false
+      }
+      if (alive) await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    try {
+      process.kill(pid, "SIGKILL")
+    } catch {
+      // already gone
+    }
+    expect(alive).toBe(false)
+  }, 15_000)
 
   it("two calls while one is in flight share the same run", async () => {
     let calls = 0

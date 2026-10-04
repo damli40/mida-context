@@ -4,11 +4,11 @@
 // and nothing else. An agent CLI runs as an agentCli command: a fresh empty
 // folder, MIDA_INNER set, and a usage limit named for what it is.
 
-import { execFile } from "node:child_process"
-import { promisify } from "node:util"
+import crossSpawn from "cross-spawn"
 import { accessSync, statSync, constants } from "node:fs"
-import { delimiter, isAbsolute, join } from "node:path"
+import { delimiter, isAbsolute, join, win32 } from "node:path"
 import type { ModelCommand } from "./compile.js"
+import { killProcessTree } from "./process-tree.js"
 import { COMPILE_PROVIDERS, compileModelChoice, providerHost, providerModelCommand } from "./model-choice.js"
 
 export const CLAUDE_SUMMARY_MODEL_DEFAULT = "haiku"
@@ -53,8 +53,6 @@ export function codexSummaryCommand(env: NodeJS.ProcessEnv): ModelCommand {
   }
 }
 
-const execFileAsync = promisify(execFile)
-
 /**
  * The absolute path of the first regular, executable file called `name` in an
  * ABSOLUTE folder of `pathValue`; non-absolute PATH entries — the empty entry
@@ -62,17 +60,31 @@ const execFileAsync = promisify(execFile)
  * the long-lived service happens to have. It never spawns the binary — install
  * checks must not run what they probe.
  */
-export function resolveBinary(name: string, pathValue: string | undefined): string | undefined {
+export function resolveBinary(
+  name: string,
+  pathValue: string | undefined,
+  platform: NodeJS.Platform = process.platform,
+  pathExt: string | undefined = process.env.PATHEXT,
+): string | undefined {
   if (pathValue === undefined || pathValue === "") return undefined
-  for (const dir of pathValue.split(delimiter)) {
-    if (!isAbsolute(dir)) continue
-    const file = join(dir, name)
-    try {
-      if (!statSync(file).isFile()) continue
-      accessSync(file, constants.X_OK)
-      return file
-    } catch {
-      // absent, a folder of that name, or not executable by this user
+  const windows = platform === "win32"
+  // Windows: PATH is split on ";" and a bare name runs as name + one of PATHEXT's endings,
+  // tried in PATHEXT's order (claude.exe from the native installer, claude.cmd from npm)
+  const names = windows
+    ? (pathExt ?? ".COM;.EXE;.BAT;.CMD").split(";").filter((ext) => ext !== "").map((ext) => `${name}${ext.toLowerCase()}`)
+    : [name]
+  for (const dir of pathValue.split(windows ? ";" : delimiter)) {
+    if (!(isAbsolute(dir) || win32.isAbsolute(dir))) continue
+    for (const candidate of names) {
+      const file = join(dir, candidate)
+      try {
+        if (!statSync(file).isFile()) continue
+        // Windows has no execute bit
+        if (!windows) accessSync(file, constants.X_OK)
+        return file
+      } catch {
+        // absent, a folder of that name, or not executable by this user
+      }
     }
   }
   return undefined
@@ -102,20 +114,45 @@ const binaryMtime = (binary: string): number => {
   }
 }
 
-/** The real `claude --help`: 3 s, SIGKILL on expiry, no ANTHROPIC_* names, MIDA_INNER set. */
-const defaultSafeModeRun = async (binary: string): Promise<{ status: number | null; stdout: string }> => {
+/** The real `claude --help`: 3 s, the whole tree killed on expiry, no ANTHROPIC_* names, MIDA_INNER set. */
+const defaultSafeModeRun = (binary: string): Promise<{ status: number | null; stdout: string }> => {
   const env: NodeJS.ProcessEnv = { ...process.env, MIDA_INNER: "1" }
   for (const key of Object.keys(env)) {
     if (key.startsWith("ANTHROPIC_")) delete env[key]
   }
-  try {
-    const { stdout } = await execFileAsync(binary, ["--help"], { timeout: 3000, killSignal: "SIGKILL", env, encoding: "utf8" })
-    return { status: 0, stdout: stdout ?? "" }
-  } catch (error) {
-    // a non-zero exit carries its code; a timeout, signal or spawn failure is status null
-    const e = error as { code?: unknown; stdout?: unknown }
-    return { status: typeof e.code === "number" ? e.code : null, stdout: typeof e.stdout === "string" ? e.stdout : "" }
-  }
+  return new Promise((resolve) => {
+    let stdout = ""
+    let settled = false
+    // cross-spawn runs a .cmd launcher on Windows (plain spawn cannot); on POSIX it is
+    // child_process.spawn unchanged
+    const child = crossSpawn(binary, ["--help"], { env, windowsHide: true })
+    const finish = (status: number | null) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve({ status, stdout })
+    }
+    const timer = setTimeout(() => {
+      if (child.pid !== undefined) {
+        try {
+          killProcessTree(child.pid)
+        } catch {
+          try {
+            // the group kill can miss a child that is not a group leader; the direct fallback
+            // kills outright, the same signal the old execFile timeout sent on Mac and Linux
+            child.kill("SIGKILL")
+          } catch {
+            // already gone
+          }
+        }
+      }
+      // a timed-out probe answers status null, the same contract the execFile run kept
+      finish(null)
+    }, 3000)
+    child.stdout?.on("data", (chunk: Buffer | string) => (stdout += chunk.toString()))
+    child.on("error", () => finish(null))
+    child.on("close", (code) => finish(code))
+  })
 }
 
 /**

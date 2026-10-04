@@ -199,6 +199,17 @@ function childEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   return env
 }
 
+/**
+ * The EXTRA env every `claude -p` child gets (agents A and C) on top of what
+ * childEnv builds. Claude Code marks a `claude -p` session
+ * `entrypoint: "sdk-cli"` in its transcript, and the capture hook now skips
+ * headless sessions unless the caller asks for them — the bench exists to have
+ * these runs saved, so it opts in. MIDA_HOME joins only in the mida condition.
+ */
+export function claudeRunEnv(condition: Args["condition"], midaHome: string): Record<string, string> {
+  return { MIDA_CAPTURE_HEADLESS: "1", ...(condition === "mida" ? { MIDA_HOME: midaHome } : {}) }
+}
+
 // ---------- the files a run writes (dry-run prints these; real mode writes them) ----------
 
 function claudeSettings(): Record<string, unknown> {
@@ -562,7 +573,7 @@ function dryRun(args: Args): void {
     {
       agent: "A",
       cwd: work,
-      env: args.condition === "mida" ? { MIDA_HOME: midaHome } : {},
+      env: claudeRunEnv(args.condition, midaHome),
       argv: args.agentACmd !== undefined
         ? JSON.parse(args.agentACmd)
         : agentAArgv(taskText, args.condition === "mida" ? join(runDir, "claude-settings.json") : undefined),
@@ -582,7 +593,7 @@ function dryRun(args: Args): void {
       {
         agent: "C",
         cwd: work,
-        env: args.condition === "mida" ? { MIDA_HOME: midaHome } : {},
+        env: claudeRunEnv(args.condition, midaHome),
         argv: agentCArgv(
           LATE_CHANGE_PROMPT,
           args.condition === "mida" ? join(runDir, "claude-settings.json") : undefined,
@@ -690,7 +701,10 @@ async function realRun(args: Args): Promise<number> {
   }
 
     // --- Agent A ---
-    const aEnv = childEnv(args.condition === "mida" ? { MIDA_HOME: midaHomePath } : {})
+    // CAP-42: agents A and C are `claude -p` sessions — opt them into capture or
+    // the hook would skip exactly the runs this benchmark exists to save. Agent
+    // C reuses this same env below.
+    const aEnv = childEnv(claudeRunEnv(args.condition, midaHomePath))
     const apiKeyVarsStripped = API_KEY_VARS.some((k) => process.env[k] !== undefined)
     const aOut = openSync(join(runDir, "a-output.jsonl"), "w")
     const abort = new AbortController()

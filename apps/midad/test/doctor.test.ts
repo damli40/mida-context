@@ -1,12 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { spawn, spawnSync } from "node:child_process"
 import type { ChildProcess } from "node:child_process"
+import { EventEmitter } from "node:events"
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs"
 import { createServer } from "node:net"
 import type { AddressInfo, Server } from "node:net"
 import { createServer as createHttpServer } from "node:http"
 import { tmpdir } from "node:os"
-import { dirname, join, resolve } from "node:path"
+import { basename, dirname, join, resolve } from "node:path"
 import { fileURLToPath } from "node:url"
 import { toFunctionSelector } from "viem"
 import { privateKeyToAccount } from "viem/accounts"
@@ -14,8 +15,9 @@ import { encodeUint64 } from "@mida/protocol"
 import { parseDeployment } from "@mida/chain"
 import { CODEX_BLOCK_V1, CODEX_TRUST_SENTENCE, MidaHome, approveProject, claudeCodeMcpJson, doctorReplaceStaleService, enqueue, ensureCurrentDaemon, expectedScopesFor, installClaudeCode, installCodex, installDevin, isMidaProcess, linkProject, loadOrCreateOwnerSecrets, recordCodexHome, runDoctor, runDoctorLive, runInstall, saveOwnerAddress, saveOwnerMode, socketPathFor, writeSummarizer } from "@mida/midad"
 import { expandScopeInputs } from "@mida/grant-advisor"
-import type { Runtime } from "@mida/midad"
+import type { DoctorDeps, Runtime } from "@mida/midad"
 import { codeIdentity } from "../src/code-identity.js"
+import { startToolSession } from "../src/doctor.js"
 
 const dir = () => mkdtempSync(join(tmpdir(), "mida-doctor-"))
 
@@ -67,7 +69,7 @@ async function stubDaemon(home: MidaHome, status: number, body: unknown): Promis
   })
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject)
-    server.listen(socketPathFor(home), () => resolve())
+    server.listen(socketPathFor(home)!, () => resolve())
   })
   return server
 }
@@ -108,7 +110,7 @@ describe("mida doctor without a chain", () => {
     home.writeSecretJson("midad.lock", { pid: holder.pid })
     home.writeSecretJson("api-url.json", { baseUrl: "http://127.0.0.1:9" })
     const lines: string[] = []
-    const code = await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50 })
+    const code = await runDoctor({ home, print: (line) => lines.push(line), settings: {}, env: {}, daemonProbeMs: 50, platform: "darwin" })
     expect(lines).toContain(
       `PROBLEM: the Mida service (pid ${holder.pid}) is running but has not answered for 5 s. If mida doctor still says this in a minute, stop it with kill ${holder.pid}, then open any agent session or run mida task to start a fresh one.`,
     )
@@ -1845,6 +1847,55 @@ describe("mida doctor --live", () => {
     expect(replaced).toBe(1)
     expect(sessions).toBe(1)
   })
+
+  it("the tool it starts is resolved on PATH only — a claude.cmd in the working folder is never spawned", () => {
+    const cwd = dir()
+    writeFileSync(join(cwd, "claude.cmd"), "@echo off\r\n")
+    const spawned: string[] = []
+    const session = startToolSession("claude-code", cwd, {
+      env: { PATH: dir() },
+      spawn: ((command: string) => {
+        spawned.push(command)
+        return new EventEmitter()
+      }) as never,
+    })
+    session.stop()
+    expect(spawned).toEqual([])
+  })
+
+  it("the PATH-resolved absolute path is what spawns", () => {
+    const pathDir = dir()
+    const binary = join(pathDir, "claude")
+    writeFileSync(binary, "#!/bin/sh\n")
+    chmodSync(binary, 0o755)
+    const spawned: { command: string; args: string[] }[] = []
+    const session = startToolSession("claude-code", dir(), {
+      env: { PATH: pathDir },
+      spawn: ((command: string, args: string[]) => {
+        spawned.push({ command, args })
+        return new EventEmitter()
+      }) as never,
+    })
+    session.stop()
+    expect(spawned).toEqual([{ command: binary, args: ["-p", "Reply with the word ok."] }])
+  })
+
+  it("codex resolves the same way", () => {
+    const pathDir = dir()
+    const binary = join(pathDir, "codex")
+    writeFileSync(binary, "#!/bin/sh\n")
+    chmodSync(binary, 0o755)
+    const spawned: { command: string; args: string[] }[] = []
+    const session = startToolSession("codex", dir(), {
+      env: { PATH: pathDir },
+      spawn: ((command: string, args: string[]) => {
+        spawned.push({ command, args })
+        return new EventEmitter()
+      }) as never,
+    })
+    session.stop()
+    expect(spawned).toEqual([{ command: binary, args: ["exec", "Reply with the word ok."] }])
+  })
 })
 
 describe("mida doctor on a passkey home", () => {
@@ -2513,5 +2564,89 @@ describe("mida doctor on an approval that was never recorded (UF-AP)", () => {
     } finally {
       await rpc.close()
     }
+  })
+})
+
+// Task 12 of the Windows port. The three checks that change on win32: a hook pointing at a
+// node.exe that is gone names the hook reinstall (Review Focus 3), Windows has no execute bit
+// to check, and a MIDA_HOME outside %USERPROFILE% earns a note because its ACL is unknown.
+describe("doctor on Windows", () => {
+  const HOOK_EVENTS = ["PostToolUse", "Stop", "StopFailure", "PreCompact", "SessionEnd"] as const
+  const INJECT_EVENTS = ["SessionStart", "UserPromptSubmit"] as const
+  const INJECT_SIBLING: Record<string, string> = { "mida-hook": "mida-inject", "mida-hook.js": "mida-inject.js", "hook-main.ts": "inject-main.ts" }
+
+  /** A real file doctor's parser reads as Mida's hook entry: the repo's own hook-main.ts. */
+  const existingScript = (): string => join(repo, "apps/midad/src/hook-main.ts")
+
+  /**
+   * A settings.json that reads as installed-but-stale so the hooks check walks the paths in it:
+   * the given hook entry under the five hook events, its inject sibling under the two prompt
+   * events, the shape a real install leaves.
+   */
+  const tempSettingsWithEntry = (entry: { type: "command"; command: string; args?: string[] }): string => {
+    const file = join(dir(), "settings.json")
+    const inject = {
+      ...entry,
+      args: entry.args?.map((arg, index) => {
+        const mapped = index < (entry.args?.length ?? 0) - 1 ? INJECT_SIBLING[basename(arg)] : undefined
+        return mapped === undefined ? arg : join(dirname(arg), mapped)
+      }),
+    }
+    const hooks: Record<string, unknown> = {}
+    for (const event of HOOK_EVENTS) hooks[event] = [{ hooks: [{ ...entry }] }]
+    for (const event of INJECT_EVENTS) hooks[event] = [{ hooks: [inject] }]
+    writeFileSync(file, `${JSON.stringify({ hooks }, null, 2)}\n`)
+    return file
+  }
+
+  const doctorLines = async (overrides: Partial<DoctorDeps> = {}): Promise<string[]> => {
+    const lines: string[] = []
+    await runDoctor({
+      home: new MidaHome(join(dir(), "home")),
+      print: (line) => lines.push(line),
+      env: {},
+      daemonProbeMs: 50,
+      ...overrides,
+    })
+    return lines
+  }
+
+  it("a hook pointing at a node.exe that is gone names the reinstall (Review Focus 3)", async () => {
+    const settings = tempSettingsWithEntry({ type: "command", command: "C:\\gone\\node.exe", args: [existingScript(), "claude-code"] })
+    const lines = await doctorLines({ platform: "win32", settings: { "claude-code": settings } })
+    expect(lines).toContain(
+      "PROBLEM: the Claude Code hooks run C:\\gone\\node.exe, which is gone (Node was moved or reinstalled) — run mida install claude-code again",
+    )
+  })
+
+  it("Windows has no execute bit: an existing script is fine", async () => {
+    // the program is a file with no execute bit: on any OS this only passes when doctor's
+    // Windows branch answers by existence alone, which is the behaviour under test
+    const program = join(dir(), "node.exe")
+    writeFileSync(program, "not a binary\n")
+    chmodSync(program, 0o644)
+    const settings = tempSettingsWithEntry({ type: "command", command: program, args: [existingScript(), "claude-code"] })
+    const lines = await doctorLines({ platform: "win32", settings: { "claude-code": settings } })
+    expect(lines.some((line) => line.includes("not executable"))).toBe(false)
+  })
+
+  it("a Mida folder outside the user folder gets a note", async () => {
+    const lines = await doctorLines({ platform: "win32", homeRoot: "D:\\mida", userProfile: "C:\\Users\\J" })
+    expect(lines).toContain(
+      "note: Mida's folder D:\\mida is outside your user folder, so Mida cannot vouch for who can read it. Move it under C:\\Users\\J or unset MIDA_HOME.",
+    )
+  })
+
+  it("the stop advice names taskkill on Windows, not the Unix kill", async () => {
+    // the same live-lock, dead-socket setup as the in-29 test; only the command changes
+    const home = new MidaHome(join(dir(), "home"))
+    const holder = spawnHolder("bundled")
+    home.writeSecretJson("midad.lock", { pid: holder.pid })
+    home.writeSecretJson("api-url.json", { baseUrl: "http://127.0.0.1:9" })
+    const lines = await doctorLines({ home, platform: "win32", settings: {} })
+    expect(lines).toContain(
+      `PROBLEM: the Mida service (pid ${holder.pid}) is running but has not answered for 5 s. If mida doctor still says this in a minute, stop it with taskkill /PID ${holder.pid} /F, then open any agent session or run mida task to start a fresh one.`,
+    )
+    expect(lines.some((line) => line.includes(`kill ${holder.pid}`))).toBe(false)
   })
 })

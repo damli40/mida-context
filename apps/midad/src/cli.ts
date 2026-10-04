@@ -27,7 +27,7 @@ import { buildHandoff, generalAssistanceText, identityUnreadableText, isGeneralA
 import { MidaHome, resolveHome } from "./home.js"
 import { drainerEnv } from "./hook.js"
 import { agoText } from "./hook-output.js"
-import { CODEX_TRUST_SENTENCE, InstallRefusal, MCP_CLIENT_TOOLS, MCP_SERVER_NAME, claudeDesktopConfigPath, claudeUserConfigPath, codexHookCommands, cursorMcpConfigPath, installClaudeCode, installClaudeCodeMcp, installCodex, installDevin, installMcpClient, macosProtectedFolderNote, mcpLauncherPath, spawnClaude, uninstallClaudeCode, uninstallClaudeCodeMcp, uninstallCodex, uninstallDevin, uninstallMcpClient } from "./install.js"
+import { CODEX_TRUST_SENTENCE, InstallRefusal, MCP_CLIENT_TOOLS, MCP_SERVER_NAME, claudeDesktopConfigPath, claudeDesktopConfigPaths, claudeUserConfigPath, codexHookCommands, cursorMcpConfigPath, installClaudeCode, installClaudeCodeMcp, installCodex, installDevin, installMcpClient, macosProtectedFolderNote, mcpLauncherPath, spawnClaude, uninstallClaudeCode, uninstallClaudeCodeMcp, uninstallCodex, uninstallDevin, uninstallMcpClient } from "./install.js"
 import type { ClaudeCliRunner } from "./install.js"
 import { resolveDevinConfigPath } from "./devin-facts.js"
 import type { InstallTool, McpClientTool } from "./install.js"
@@ -54,7 +54,7 @@ import type { Network } from "./runtime.js"
 import { ownerCommandNotice, readSavedNetwork, resolveNetwork, setBatchingFlag, setSponsorUrl } from "./network.js"
 import { resetOutOfGasWaits } from "./drain.js"
 import type { ResolveDeps, ResolvedNetwork } from "./network.js"
-import { siblingEntryArgs } from "./sibling.js"
+import { detachedSpawnOptions, siblingEntryArgs } from "./sibling.js"
 import { approve, authorNamesFor, deploymentMismatchError, hasAnyLiveCapability, init, pendingApprovalGate, readCheckpoints, requestAccess, resolveAgentId, revoke, saveCheckpoint, ungrantedScopes } from "./skeleton.js"
 import { isRevoked, listAgentNames, loadAgentIdentity, loadGrants, loadOrCreateOwnerSecrets, loadOwnerAddress, loadOwnerMode, saveOwnerAddress } from "./keys.js"
 import { DEFAULT_TASK, TASK_RULE_TEXT, clearFolderTask, folderTaskFor, isTaskName, resolveSessionTask, taskOrUndefined, writeFolderTask } from "./task.js"
@@ -236,6 +236,8 @@ export interface CliDeps {
   startService?: () => unknown | Promise<unknown>
   /** Claude Desktop's config file — `mida install claude-desktop` merges into it. Tests inject a temp path. */
   claudeDesktopConfig?: string
+  /** Every Claude Desktop config install writes. Windows can carry the Store copy beside the roaming one. Tests inject a list. */
+  claudeDesktopConfigs?: string[]
   /** Devin's config file — `mida install devin` merges the hook block into it. Tests inject a temp path. */
   devinConfig?: string
   /**
@@ -253,6 +255,15 @@ export interface CliDeps {
  * The /cli route's input rule: argv is data, never shell — an array of at most 8 strings of at most
  * 4,096 chars each, whose first word is a command runCli knows. Anything else is refused.
  */
+/**
+ * Every Claude Desktop config file an install or uninstall touches: the injected list when the
+ * caller knows them, else the platform's own set (Windows' roaming file plus the Store build's
+ * LocalCache copy when a Store package is installed).
+ */
+const claudeDesktopTargets = (deps: { claudeDesktopConfig?: string; claudeDesktopConfigs?: string[] }): string[] =>
+  deps.claudeDesktopConfigs ??
+  (deps.claudeDesktopConfig !== undefined ? [deps.claudeDesktopConfig] : claudeDesktopConfigPaths(homedir()))
+
 export function validCliArgv(argv: unknown): argv is string[] {
   return (
     Array.isArray(argv) &&
@@ -1176,15 +1187,17 @@ async function runOwnerCommand(argv: string[], runtime: Runtime, deps: CliDeps):
       }
       const client = tool as McpClientTool
       const cwd = deps.cwd ?? process.cwd()
-      const configPath = client === "cursor"
-        ? cursorMcpConfigPath(cwd)
-        : deps.claudeDesktopConfig ?? claudeDesktopConfigPath(homedir())
-      const outcome = installMcpClient(client, configPath, runtime.home.root, cwd)
-      if (typeof outcome === "object") {
-        deps.print("installed")
-        deps.print(`the ${MCP_SERVER_NAME[client]} entry moved from ${outcome.moved.from} to ${outcome.moved.to}`)
-      } else {
-        deps.print(outcome === "already-installed" ? "already installed" : "installed")
+      const configPaths = client === "cursor" ? [cursorMcpConfigPath(cwd)] : claudeDesktopTargets(deps)
+      for (const configPath of configPaths) {
+        const outcome = installMcpClient(client, configPath, runtime.home.root, cwd, deps.platform ?? process.platform)
+        // several files (Windows' roaming + Store configs) name themselves on their own line
+        const suffix = configPaths.length > 1 ? ` (${configPath})` : ""
+        if (typeof outcome === "object") {
+          deps.print(`installed${suffix}`)
+          deps.print(`the ${MCP_SERVER_NAME[client]} entry moved from ${outcome.moved.from} to ${outcome.moved.to}${suffix}`)
+        } else {
+          deps.print(`${outcome === "already-installed" ? "already installed" : "installed"}${suffix}`)
+        }
       }
       // the per-workspace mcp.json carries personal absolute paths (the launcher, the home) —
       // committing it would leak the machine's layout to anyone reading the repo
@@ -1804,6 +1817,14 @@ function sponsorTimeoutHint(agent: string, error: unknown): string | undefined {
 }
 
 export function ownerRefusalLine(command: string, agent: string, error: unknown, ownerAddress?: string, capabilityRegistry?: string, home?: MidaHome, undo = false): string {
+  // UF-APR7B R5: commands with no agent argument (`mida init`, `mida migrate`) pass "" — or a
+  // flag (`mida init --passkey` passes "--passkey" through argv[1], which is not a name either).
+  // The agent whose step failed rides on the error itself (stamped by the caller), so the
+  // refusal line names "assistant's request" instead of "'s request … run `mida request `".
+  if (agent === "" || agent.startsWith("-")) {
+    const carried = (error as { agent?: unknown } | null | undefined)?.agent
+    if (typeof carried === "string") agent = carried
+  }
   const code = refusalCode(error)
   // The "nothing was sent/written" claims are true only before migrate's first transaction —
   // the state file tells the three cases apart (ex-4 G-1): no move started keeps the plain
@@ -1974,6 +1995,11 @@ export function ownerRefusalLine(command: string, agent: string, error: unknown,
     // retry that adds the folder row.
     case "approved-unlisted":
       return error instanceof Error ? error.message : "refused: approved-unlisted"
+    // UF-APR7: the assistant's grant is init's own — when the chain approves it but this machine
+    // never finished recording it, approve can never finish what only init's saved request can,
+    // so the wrapped message names the command that can.
+    case "assistant-grant-via-init":
+      return error instanceof Error ? error.message : "refused: assistant-grant-via-init"
     case "chain-busy":
       return partway === undefined
         ? "Monad is busy right now — nothing was sent or decided; wait a moment and run the same command again"
@@ -2202,15 +2228,16 @@ async function runPasskeyOwnerCommand(argv: string[], deps: CliDeps, mode: Owner
         }
         const client = tool as McpClientTool
         const cwd = deps.cwd ?? process.cwd()
-        const configPath = client === "cursor"
-          ? cursorMcpConfigPath(cwd)
-          : deps.claudeDesktopConfig ?? claudeDesktopConfigPath(homedir())
-        const outcome = installMcpClient(client, configPath, deps.home.root, cwd)
-        if (typeof outcome === "object") {
-          deps.print("installed")
-          deps.print(`the ${MCP_SERVER_NAME[client]} entry moved from ${outcome.moved.from} to ${outcome.moved.to}`)
-        } else {
-          deps.print(outcome === "already-installed" ? "already installed" : "installed")
+        const configPaths = client === "cursor" ? [cursorMcpConfigPath(cwd)] : claudeDesktopTargets(deps)
+        for (const configPath of configPaths) {
+          const outcome = installMcpClient(client, configPath, deps.home.root, cwd, deps.platform ?? process.platform)
+          const suffix = configPaths.length > 1 ? ` (${configPath})` : ""
+          if (typeof outcome === "object") {
+            deps.print(`installed${suffix}`)
+            deps.print(`the ${MCP_SERVER_NAME[client]} entry moved from ${outcome.moved.from} to ${outcome.moved.to}${suffix}`)
+          } else {
+            deps.print(`${outcome === "already-installed" ? "already installed" : "installed"}${suffix}`)
+          }
         }
         if (client === "cursor") deps.print("heads-up: .cursor/mcp.json holds absolute paths from this machine — do not commit it")
         const protectedNote = macosProtectedFolderNote(
@@ -2653,6 +2680,7 @@ export function runInstall(
     home: MidaHome
     cwd?: string
     claudeDesktopConfig?: string
+    claudeDesktopConfigs?: string[]
     devinConfig?: string
     /** Claude Code's MCP servers live in ~/.claude.json — owned by Claude Code, read only for the is-it-ours check. */
     claudeUserConfig?: string
@@ -2693,14 +2721,15 @@ export function runInstall(
   if (MCP_CLIENT_TOOLS.includes(tool)) {
     const client = tool as McpClientTool
     const cwd = deps.cwd ?? process.cwd()
-    const configPath = client === "cursor"
-      ? cursorMcpConfigPath(cwd)
-      : deps.claudeDesktopConfig ?? claudeDesktopConfigPath(homedir())
+    const configPaths = client === "cursor" ? [cursorMcpConfigPath(cwd)] : claudeDesktopTargets(deps)
     try {
-      const outcome = uninstallMcpClient(client, configPath, deps.home.root)
-      deps.print(outcome === "not-installed" ? "not installed" : outcome)
-      if (outcome === "uninstalled") {
-        deps.print(`the ${client} identity and its approvals are unchanged — \`mida revoke ${client}\` revokes access`)
+      for (const configPath of configPaths) {
+        const outcome = uninstallMcpClient(client, configPath, deps.home.root)
+        const suffix = configPaths.length > 1 ? ` (${configPath})` : ""
+        deps.print(`${outcome === "not-installed" ? "not installed" : outcome}${suffix}`)
+        if (outcome === "uninstalled") {
+          deps.print(`the ${client} identity and its approvals are unchanged — \`mida revoke ${client}\` revokes access${suffix}`)
+        }
       }
       return 0
     } catch (error) {
@@ -2803,12 +2832,7 @@ const CLI_CALL_TIMEOUT_MS = 120_000
  * directory is the Mida home — never the folder the code happens to live in.
  */
 function spawnDaemon(cwd: string): void {
-  const child = spawn(process.execPath, siblingEntryArgs("midad"), {
-    detached: true,
-    stdio: "ignore",
-    cwd,
-    env: drainerEnv(process.env),
-  })
+  const child = spawn(process.execPath, siblingEntryArgs("midad"), detachedSpawnOptions(cwd, drainerEnv(process.env)))
   child.on("error", () => {})
   child.unref()
 }
@@ -2874,7 +2898,7 @@ async function main(): Promise<void> {
       claudeSettings: join(homedir(), ".claude", "settings.json"),
       codexConfig: join(resolveCodexHome(process.env, homedir()), "config.toml"),
       home,
-      claudeDesktopConfig: claudeDesktopConfigPath(homedir()),
+      claudeDesktopConfigs: claudeDesktopConfigPaths(homedir()),
       devinConfig: resolveDevinConfigPath(process.env, homedir()),
     })
     return

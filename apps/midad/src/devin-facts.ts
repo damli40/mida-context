@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process"
 import { lstatSync, realpathSync } from "node:fs"
 import { basename, isAbsolute, join } from "node:path"
+import { isWindows } from "./platform.js"
 
 /**
  * Devin CLI facts the code depends on — from Devin docs / local inspection, Sep 25
@@ -59,7 +60,8 @@ export const DEVIN_PROJECT_DIR_ENV = "DEVIN_PROJECT_DIR"
  * measured on macOS — acceptable because the call is lazy (only when the env wall did not
  * already settle the question).
  */
-export function parentProcessBasename(pid: number = process.ppid): string | undefined {
+export function parentProcessBasename(pid: number = process.ppid, platform: NodeJS.Platform = process.platform): string | undefined {
+  if (isWindows(platform)) return undefined // Devin is not a Windows agent, so no lookup is even tried
   try {
     const result = spawnSync("ps", ["-o", "comm=", "-p", String(pid)], { encoding: "utf8", timeout: 1_000 })
     if (result.error !== undefined || result.status !== 0 || typeof result.stdout !== "string") return undefined

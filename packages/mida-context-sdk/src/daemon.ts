@@ -1,5 +1,5 @@
 import { existsSync, readFileSync } from "node:fs"
-import { request } from "node:http"
+import { Agent, request } from "node:http"
 import { homedir, tmpdir } from "node:os"
 import { isAbsolute, join, resolve } from "node:path"
 import { sha256 } from "@noble/hashes/sha2.js"
@@ -29,13 +29,33 @@ export function resolveMidaHome(home: string | undefined, env: Record<string, st
 }
 
 /**
+ * The pointer's two lines on Windows: the pipe name, then the secret this service start answers
+ * /ping with. A one-line pointer predates the token, and the name it carries could have been
+ * re-created by another account on the PC, so it reads as no pointer at all.
+ */
+function pipePointerFor(home: string): { name: string; token: string } | undefined {
+  try {
+    const pointer = join(home, `${SOCKET_FILE}.path`)
+    if (!existsSync(pointer)) return undefined
+    const [name, token] = readFileSync(pointer, "utf8").split("\n").map((line) => line.trim())
+    if (name === undefined || name === "" || token === undefined || token === "") return undefined
+    return { name, token }
+  } catch {
+    return undefined
+  }
+}
+
+/**
  * The same socket path the daemon computes: `<home>/midad.sock`, a pointer file
  * (`midad.sock.path`) winning when present, and the per-user fallback folder
  * `<base>/mida-<uid>/mida-<16 hex of sha256(home)>.sock` when the direct path is too long.
  * Must stay byte-for-byte equivalent to control.ts's `socketPathFor` — the daemon writes the
- * pointer for exactly the cases the computed path would miss.
+ * pointer for exactly the cases the computed path would miss. On Windows the pointer is the ONLY
+ * address (the service binds a fresh random named pipe per start and records it with a secret
+ * token), so with no two-line pointer this returns undefined and no name is ever guessed.
  */
-export function socketPathFor(home: string, base: string = tmpdir()): string {
+export function socketPathFor(home: string, base: string = tmpdir(), platform: NodeJS.Platform = process.platform): string | undefined {
+  if (platform === "win32") return pipePointerFor(home)?.name
   try {
     const pointer = join(home, `${SOCKET_FILE}.path`)
     if (existsSync(pointer)) {
@@ -51,6 +71,21 @@ export function socketPathFor(home: string, base: string = tmpdir()): string {
   return join(base, `mida-${uid}`, `mida-${bytesToHex(sha256(utf8ToBytes(home))).slice(0, 16)}.sock`)
 }
 
+/**
+ * The channel a client may use: the address, and on Windows the proof it must see before trusting
+ * it, that being the token the pointer names, which only the service that wrote the pointer can
+ * answer /ping with. Mac and Linux channels carry no token; the socket file's own permissions
+ * are the proof there.
+ */
+export function channelFor(home: string, base: string = tmpdir(), platform: NodeJS.Platform = process.platform): { socketPath: string; token?: string } | undefined {
+  if (platform === "win32") {
+    const pointer = pipePointerFor(home)
+    return pointer === undefined ? undefined : { socketPath: pointer.name, token: pointer.token }
+  }
+  const socketPath = socketPathFor(home, base, platform)
+  return socketPath === undefined ? undefined : { socketPath }
+}
+
 export interface DaemonReply {
   /** 0 means no answer — no socket, refused connection, timeout, or a non-JSON body. */
   status: number
@@ -61,14 +96,22 @@ export interface DaemonReply {
  * One JSON call to the daemon over the private socket. Never throws and never hangs: any failure
  * resolves to status 0, and the caller turns that into `service-unavailable`. A body of
  * `undefined` sends GET; anything else is POSTed as JSON.
+ *
+ * On Windows the call is two steps over ONE keep-alive connection: a bodyless GET /ping must
+ * answer with the token the pointer names, which only the service that wrote the pointer knows,
+ * and only then does the real request go down the same connection. A pipe that answers without
+ * the token was made by someone else and receives nothing — and a real reply that cannot prove
+ * the token is refused the same way, because a probe connection that dropped could have left
+ * the body on a pipe another account owns.
  */
-export function callDaemon(home: string, path: string, body: unknown, options: { timeoutMs: number }): Promise<DaemonReply> {
+export function callDaemon(home: string, path: string, body: unknown, options: { timeoutMs: number; platform?: NodeJS.Platform }): Promise<DaemonReply> {
   return new Promise((resolve) => {
     let settled = false
     const finish = (reply: DaemonReply) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
+      agent?.destroy()
       resolve(reply)
     }
     const fail = () => finish({ status: 0, body: null })
@@ -82,34 +125,74 @@ export function callDaemon(home: string, path: string, body: unknown, options: {
     }, options.timeoutMs)
     if (typeof timer.unref === "function") timer.unref()
     let req: ReturnType<typeof request> | undefined
+    let agent: Agent | undefined
     try {
       const payload = body === undefined ? null : Buffer.from(JSON.stringify(body), "utf8")
-      req = request(
-        {
-          socketPath: socketPathFor(home),
-          path,
-          method: payload === null ? "GET" : "POST",
-          headers: payload === null ? {} : { "content-type": "application/json", "content-length": payload.length },
-        },
-        (res) => {
-          const chunks: Buffer[] = []
-          let size = 0
-          res.on("data", (chunk: Buffer) => {
-            size += chunk.length
-            if (size <= 1024 * 1024) chunks.push(chunk)
-          })
-          res.on("end", () => {
-            try {
-              finish({ status: res.statusCode ?? 0, body: JSON.parse(Buffer.concat(chunks).toString("utf8")) })
-            } catch {
-              fail()
-            }
-          })
-          res.on("error", fail)
-        },
-      )
-      req.on("error", fail)
-      req.end(payload ?? undefined)
+      const channel = channelFor(home, tmpdir(), options.platform ?? process.platform)
+      if (channel === undefined) {
+        fail()
+        return
+      }
+      // One attempt; `done` always runs, since every failure resolves through the callback.
+      const send = (reqPath: string, data: Buffer | null, done: (reply: DaemonReply & { token?: string }) => void): void => {
+        try {
+          req = request(
+            {
+              socketPath: channel.socketPath,
+              path: reqPath,
+              method: data === null ? "GET" : "POST",
+              headers: data === null ? {} : { "content-type": "application/json", "content-length": data.length },
+              agent,
+            },
+            (res) => {
+              const chunks: Buffer[] = []
+              let size = 0
+              res.on("data", (chunk: Buffer) => {
+                size += chunk.length
+                if (size <= 1024 * 1024) chunks.push(chunk)
+              })
+              res.on("end", () => {
+                const token = res.headers["x-mida-token"]
+                try {
+                  done({
+                    status: res.statusCode ?? 0,
+                    body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
+                    token: typeof token === "string" ? token : undefined,
+                  })
+                } catch {
+                  done({ status: 0, body: null })
+                }
+              })
+              res.on("error", () => done({ status: 0, body: null }))
+            },
+          )
+          req.on("error", () => done({ status: 0, body: null }))
+          req.end(data ?? undefined)
+        } catch {
+          done({ status: 0, body: null })
+        }
+      }
+      const deliver = (reply: DaemonReply): void => finish({ status: reply.status, body: reply.body })
+      if (channel.token === undefined) {
+        send(path, payload, deliver)
+        return
+      }
+      // Windows only: the probe and the real request share one keep-alive connection — one
+      // pooled socket — so the body never leaves the connection the token check proved for a
+      // fresh one another account could own. The reply carries the token check too: a probe
+      // connection that dropped anyway (a service mid-stop does exactly that) puts the body
+      // on a second pipe, and that answer must prove itself the same way before it is trusted.
+      agent = new Agent({ keepAlive: true, maxSockets: 1 })
+      send("/ping", null, (probe) => {
+        if (probe.status === 0 || probe.token !== channel.token) {
+          fail()
+          return
+        }
+        send(path, payload, (answer) => {
+          if (answer.status !== 0 && answer.token === channel.token) finish({ status: answer.status, body: answer.body })
+          else fail()
+        })
+      })
     } catch {
       fail()
     }

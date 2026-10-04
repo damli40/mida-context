@@ -69,7 +69,7 @@ const fakeDaemon = (dir: MidaHome, handoffBody: unknown, silent = false): Promis
       })
     })
     s.once("error", reject)
-    s.listen(socketPathFor(dir), () => resolve(s))
+    s.listen(socketPathFor(dir)!, () => resolve(s))
   })
 
 const close = (server: Server) => new Promise<void>((done) => server.close(() => done()))
@@ -89,7 +89,7 @@ const hungDaemon = (dir: MidaHome) =>
       socket.on("data", () => {})
     })
     s.once("error", reject)
-    s.listen(socketPathFor(dir), () =>
+    s.listen(socketPathFor(dir)!, () =>
       resolve({
         stop: () =>
           new Promise<void>((done) => {
@@ -130,7 +130,7 @@ const whatsnewDaemon = (dir: MidaHome, body: unknown, opts: { silent?: boolean; 
       })
     })
     s.once("error", reject)
-    s.listen(socketPathFor(dir), () =>
+    s.listen(socketPathFor(dir)!, () =>
       resolve({
         server: s,
         stop: () =>
@@ -219,7 +219,7 @@ describe("inject-main process", () => {
     })
     await new Promise<void>((resolve, reject) => {
       s.once("error", reject)
-      s.listen(socketPathFor(dir), () => resolve())
+      s.listen(socketPathFor(dir)!, () => resolve())
     })
     try {
       const res = await run(["claude-code"], sessionStart(), dir.root, { MIDA_INNER: "1" })
@@ -475,7 +475,7 @@ const captureDaemon = (dir: MidaHome, handoffBody: unknown): Promise<{ server: S
       })
     })
     s.once("error", reject)
-    s.listen(socketPathFor(dir), () => resolve({ server: s, bodies }))
+    s.listen(socketPathFor(dir)!, () => resolve({ server: s, bodies }))
   })
 
 describe("inject-main process — devin payload", () => {

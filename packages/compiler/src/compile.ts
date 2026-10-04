@@ -4,13 +4,15 @@
 // failed call is retried with backoff, and the checkpoint is returned to the
 // caller instead of stored — the drainer owns storage.
 
-import { spawn } from "node:child_process"
+import crossSpawn from "cross-spawn"
 import { mkdtempSync, rmSync } from "node:fs"
 import os from "node:os"
-import path, { join } from "node:path"
+import { join } from "node:path"
 import { CONTENT_FIELDS, LIMITS, cutText, limitNote, onlyScaffolding, repointEvidence, splitLimitNote, validateCheckpoint, type Checkpoint, type LimitList } from "@mida/checkpoint"
 import { extractJsonObject } from "./extract-json.js"
+import { killProcessTree } from "./process-tree.js"
 import { buildExtractPrompt } from "./prompt.js"
+import { recordPath } from "./record-path.js"
 import { scrubSecrets, scrubValue } from "./scrub.js"
 import type { Conversation } from "./transcript-claude.js"
 import { readTranscriptFor } from "./transcript-codex.js"
@@ -380,7 +382,7 @@ function runModel(model: ModelCommand, prompt: string, makeTempDir?: () => strin
 
     let child
     try {
-      child = spawn(model.argv[0] ?? "", [...model.argv.slice(1)], {
+      child = crossSpawn(model.argv[0] ?? "", [...model.argv.slice(1)], {
         cwd: workDir,
         env,
         // stderr is piped for commands whose stderr is a controlled channel (stderrDetail)
@@ -389,6 +391,7 @@ function runModel(model: ModelCommand, prompt: string, makeTempDir?: () => strin
         // CLI's never reaches the detail either.
         stdio: ["pipe", "pipe", model.stderrDetail === true || model.agentCli === true ? "pipe" : "ignore"],
         detached: true,
+        windowsHide: true,
       })
     } catch (err) {
       done({ ok: false, detail: `spawn: ${err instanceof Error ? err.message : String(err)}` })
@@ -463,8 +466,9 @@ function runModel(model: ModelCommand, prompt: string, makeTempDir?: () => strin
       timedOut = true
       // Negative pid = the child's whole process group (detached made it the
       // leader); grandchildren die with the model instead of outliving it.
+      // Windows has no process groups: the helper walks the tree with taskkill.
       try {
-        process.kill(-(child.pid as number), "SIGKILL")
+        killProcessTree(child.pid as number)
       } catch {
         child.kill("SIGKILL")
       }
@@ -556,13 +560,8 @@ export async function compileCheckpoint(input: CompileInput): Promise<CompileRes
 
   // Stored paths must not leak the local folder layout: a path under the
   // project cwd becomes relative; a path still absolute under the user's
-  // home becomes "~/…". homeDir "/" is left alone (home.length > 1).
-  const rel = (p: string): string => {
-    if (input.cwd && p.startsWith(input.cwd + "/")) return p.slice(input.cwd.length + 1)
-    if (path.isAbsolute(p) && input.homeDir.length > 1 && (p === input.homeDir || p.startsWith(input.homeDir + "/")))
-      return "~" + p.slice(input.homeDir.length)
-    return p
-  }
+  // home becomes "~" plus the path's own separator. homeDir "/" is left alone (home.length > 1).
+  const rel = (p: string): string => recordPath(p, input.cwd, input.homeDir)
 
   let modelMs = 0
   // Every provider hop this compile took, in order — { the provider that failed, who took
