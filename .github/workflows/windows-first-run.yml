@@ -3,17 +3,17 @@
 # builds the workspace, packs the CLI and installs the tarball into a folder with a
 # space in its path.
 #
-# The gated steps prove one end to end pass: init, a request for each of two agents, a
-# typed approve, one saved checkpoint handed to codex at session start, a Stop hook
-# capture that lands in the queue, and a revoke that ends the handoff. If any of them
-# fails the job fails. The revoke gate requires the revoke refusal line, and the hook
-# gate requires the hook's own "enqueued" log line.
+# Every step except mida doctor is a gate: if its check fails the job fails. The gated
+# steps prove one end to end pass: init, a request for each of two agents, a typed
+# approve, mida install writing Claude Code's hooks, Codex's config and Claude
+# Desktop's tool server, one saved checkpoint delivered by each agent's own session
+# start hook, a Stop hook capture that lands in the queue, and a revoke that ends the
+# handoff. The revoke gate requires the revoke refusal line, and the hook gates
+# require the hook's own "enqueued" log line.
 #
-# The steps whose names end in "record only: needs Batch 2" exercise mida install and
-# everything that depends on it: the hook entries it writes into Claude Code's and
-# Codex's configs, and the Claude Desktop tool server. Batch 2 of the Windows port is
-# not built yet, so these steps run, write their exit codes to the log and never fail
-# the job. mida doctor is logged too and is never a gate.
+# mida doctor is logged but never a gate. The runner has no Claude Code or Codex
+# installed, so doctor reporting them missing is the expected result and must not
+# fail the job.
 name: Windows first run
 
 on:
@@ -105,35 +105,30 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not (Test-Path .mida\project.json)) { "FAIL: .mida\project.json was not written"; exit 1 }
 
-      - name: "mida install claude-code (record only: needs Batch 2)"
-        continue-on-error: true
+      - name: mida install claude-code
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $false
           Set-Location "$HOME\demo-project"
           mida install claude-code 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\install-claude-code.txt"
-          "install-claude-code $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
-          exit 0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: "mida install codex (record only: needs Batch 2)"
-        continue-on-error: true
+      - name: mida install codex
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $false
           Set-Location "$HOME\demo-project"
           mida install codex 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\install-codex.txt"
-          "install-codex $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
-          exit 0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: "mida install claude-desktop (record only: needs Batch 2)"
-        continue-on-error: true
+      - name: mida install claude-desktop
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $false
           Set-Location "$HOME\demo-project"
-          mida install claude-desktop 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\install-claude-desktop.txt"
-          "install-claude-desktop $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
-          exit 0
+          python "$env:GITHUB_WORKSPACE\scripts\windows-ci\answer-yes.py" cmd.exe /c mida install claude-desktop 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\install-claude-desktop.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path "$env:APPDATA\Claude\claude_desktop_config.json")) { "FAIL: Claude Desktop's config was not written"; exit 1 }
 
       - name: mida doctor
         continue-on-error: true
@@ -167,58 +162,56 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not (Select-String -Path "$env:RUNNER_TEMP\log\handoff.txt" -SimpleMatch "${{ env.DEMO_OBJECTIVE }}" -Quiet)) { "FAIL: codex did not receive the checkpoint"; exit 1 }
 
-      - name: "The session-start hooks, run the way each agent runs them (record only: needs Batch 2)"
-        continue-on-error: true
+      - name: The session-start hooks, run the way each agent runs them
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $false
           node "$env:GITHUB_WORKSPACE\scripts\windows-ci\run-hook.mjs" claude-code "$HOME\demo-project" 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\run-hook-claude-code.txt"
-          "run-hook-claude-code $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Select-String -Path "$env:RUNNER_TEMP\log\run-hook-claude-code.txt" -SimpleMatch "${{ env.DEMO_OBJECTIVE }}" -Quiet)) { "FAIL: claude-code's own hook entry did not deliver the checkpoint"; exit 1 }
           node "$env:GITHUB_WORKSPACE\scripts\windows-ci\run-hook.mjs" codex "$HOME\demo-project" 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\run-hook-codex.txt"
-          "run-hook-codex $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
-          exit 0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Select-String -Path "$env:RUNNER_TEMP\log\run-hook-codex.txt" -SimpleMatch "${{ env.DEMO_OBJECTIVE }}" -Quiet)) { "FAIL: codex's own hook entry did not deliver the checkpoint"; exit 1 }
 
-      - name: "The Codex config is valid TOML (record only: needs Batch 2)"
-        continue-on-error: true
+      - name: The Codex config is valid TOML
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $false
           python -c "import os,tomllib; tomllib.load(open(os.path.join(os.environ['USERPROFILE'], '.codex', 'config.toml'), 'rb'))"
-          "codex-config-toml $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
-          exit 0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: "The Claude Desktop tool server answers initialize (record only: needs Batch 2)"
-        continue-on-error: true
+      - name: The Claude Desktop tool server answers initialize
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $false
           node "$env:GITHUB_WORKSPACE\scripts\windows-ci\mcp-hello.mjs" "$env:APPDATA\Claude\claude_desktop_config.json" 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\mcp-hello.txt"
-          "mcp-hello $LASTEXITCODE" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
-          exit 0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: "The Stop hook as settings.json runs it, with no shell (record only: needs Batch 2)"
-        continue-on-error: true
+      - name: The Stop hook as settings.json runs it, with no shell
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $false
-          $code = 1
-          try {
-            $transcript = "$HOME\.claude\projects\ci\s.jsonl"
-            New-Item -ItemType Directory -Force -Path (Split-Path $transcript) | Out-Null
-            Set-Content -Path $transcript -Value '{"type":"user","message":{"role":"user","content":"ci"}}'
-            $settings = Get-Content "$HOME\.claude\settings.json" -Raw | ConvertFrom-Json
-            $hook = $settings.hooks.Stop[0].hooks[0]
-            $hookArgs = @()
-            if ($null -ne $hook.args) { $hookArgs = @($hook.args) }
-            $payload = @{ session_id = "ci-capture"; transcript_path = $transcript; cwd = "$HOME\demo-project"; hook_event_name = "Stop" } | ConvertTo-Json -Compress
-            $payload | & $hook.command @hookArgs 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\stop-hook-via-settings.txt"
-            $code = $LASTEXITCODE
-          } catch {
-            $code = 1
-            "threw: $($_.Exception.Message)" | Tee-Object "$env:RUNNER_TEMP\log\stop-hook-via-settings.txt"
+          $transcript = "$HOME\.claude\projects\ci\s.jsonl"
+          New-Item -ItemType Directory -Force -Path (Split-Path $transcript) | Out-Null
+          Set-Content -Path $transcript -Value '{"type":"user","message":{"role":"user","content":"ci"}}'
+          $settings = Get-Content "$HOME\.claude\settings.json" -Raw | ConvertFrom-Json
+          $hook = $settings.hooks.Stop[0].hooks[0]
+          $hookArgs = @()
+          if ($null -ne $hook.args) { $hookArgs = @($hook.args) }
+          $payload = @{ session_id = "ci-capture"; transcript_path = $transcript; cwd = "$HOME\demo-project"; hook_event_name = "Stop" } | ConvertTo-Json -Compress
+          $payload | & $hook.command @hookArgs 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\stop-hook-via-settings.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $hookLog = "$HOME\.mida\logs\hook.jsonl"
+          if (-not (Test-Path $hookLog)) { "FAIL: the hook log $hookLog does not exist"; exit 1 }
+          $enqueued = $null
+          foreach ($line in Get-Content $hookLog) {
+            try { $entry = $line | ConvertFrom-Json } catch { continue }
+            if ($entry.agent -eq "claude-code" -and $entry.event -eq "Stop" -and $entry.sessionId -eq "ci-capture" -and $entry.outcome -eq "enqueued" -and $entry.jobId) { $enqueued = $entry }
           }
-          "stop-hook-via-settings $code" | Add-Content "$env:RUNNER_TEMP\log\exit-codes.txt"
-          exit 0
+          if ($null -eq $enqueued) { "FAIL: the Stop hook did not enqueue a job"; exit 1 }
+          "enqueued job: $($enqueued.jobId)"
+          if (Test-Path "$HOME\.mida\queue\bad\$($enqueued.jobId).json") { "FAIL: the queued job was rejected as malformed"; exit 1 }
+          if (Test-Path "$HOME\.mida\queue\$($enqueued.jobId).json") { "queue file $($enqueued.jobId).json is still in the queue" } else { "queue file $($enqueued.jobId).json was already drained" }
 
       - name: A Stop hook capture through mida-hook directly
         run: |
@@ -255,6 +248,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (Select-String -Path "$env:RUNNER_TEMP\log\handoff-after-revoke.txt" -SimpleMatch "${{ env.DEMO_OBJECTIVE }}" -Quiet) { "FAIL: a revoked agent still received the checkpoint"; exit 1 }
           if (-not (Select-String -Path "$env:RUNNER_TEMP\log\handoff-after-revoke.txt" -SimpleMatch "(revoked by the owner)" -Quiet)) { "FAIL: the handoff after revoke did not name the revoke as the reason"; exit 1 }
+          node "$env:GITHUB_WORKSPACE\scripts\windows-ci\run-hook.mjs" codex "$HOME\demo-project" 2>&1 | Tee-Object "$env:RUNNER_TEMP\log\handoff-after-revoke-codex-way.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (Select-String -Path "$env:RUNNER_TEMP\log\handoff-after-revoke-codex-way.txt" -SimpleMatch "${{ env.DEMO_OBJECTIVE }}" -Quiet) { "FAIL: a revoked agent still received the checkpoint through its own hook entry"; exit 1 }
+          if (-not (Select-String -Path "$env:RUNNER_TEMP\log\handoff-after-revoke-codex-way.txt" -SimpleMatch "(revoked by the owner)" -Quiet)) { "FAIL: the handoff through the hook entry after revoke did not name the revoke as the reason"; exit 1 }
 
       - name: Key files are readable only by this user
         run: |
