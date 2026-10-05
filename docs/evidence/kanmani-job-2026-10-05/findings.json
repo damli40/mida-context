@@ -1,0 +1,1577 @@
+{
+  "chains": {
+    "monad": {
+      "chainId": 143,
+      "error": null
+    },
+    "monad-testnet": {
+      "chainId": 10143,
+      "error": null
+    },
+    "ethereum": {
+      "chainId": 1,
+      "error": null
+    },
+    "base": {
+      "chainId": 8453,
+      "error": null
+    },
+    "optimism": {
+      "chainId": 10,
+      "error": null
+    },
+    "arbitrum": {
+      "chainId": 42161,
+      "error": null
+    },
+    "polygon": {
+      "chainId": 137,
+      "error": null
+    },
+    "bsc": {
+      "chainId": 56,
+      "error": null
+    },
+    "avalanche": {
+      "chainId": 43114,
+      "error": null
+    },
+    "linea": {
+      "chainId": 59144,
+      "error": null
+    },
+    "scroll": {
+      "chainId": 534352,
+      "error": null
+    },
+    "gnosis": {
+      "chainId": 100,
+      "error": null
+    },
+    "celo": {
+      "chainId": 42220,
+      "error": null
+    },
+    "blast": {
+      "chainId": 81457,
+      "error": null
+    },
+    "mantle": {
+      "chainId": 5000,
+      "error": null
+    },
+    "unichain": {
+      "chainId": 130,
+      "error": null
+    },
+    "sonic": {
+      "chainId": 146,
+      "error": null
+    },
+    "zksync-era": {
+      "chainId": 324,
+      "error": null
+    },
+    "sei": {
+      "chainId": 1329,
+      "error": null
+    },
+    "hyperevm": {
+      "chainId": 999,
+      "error": null
+    },
+    "skale-europa": {
+      "chainId": 2046399126,
+      "error": null
+    },
+    "skale-calypso": {
+      "chainId": 1564830818,
+      "error": null
+    },
+    "skale-nebula": {
+      "chainId": 1482601649,
+      "error": null
+    },
+    "skale-titan": {
+      "chainId": 1350216234,
+      "error": null
+    },
+    "sepolia": {
+      "chainId": 11155111,
+      "error": null
+    },
+    "base-sepolia": {
+      "chainId": 84532,
+      "error": null
+    },
+    "arbitrum-sepolia": {
+      "chainId": 421614,
+      "error": null
+    },
+    "optimism-sepolia": {
+      "chainId": 11155420,
+      "error": null
+    },
+    "polygon-amoy": {
+      "chainId": 80002,
+      "error": null
+    },
+    "bsc-testnet": {
+      "chainId": 97,
+      "error": null
+    },
+    "avalanche-fuji": {
+      "chainId": 43113,
+      "error": null
+    }
+  },
+  "findings": [
+    {
+      "claim": "143_10180_0x103040545AC5031A11E8C03dd11324C7333a13C7_2",
+      "url": "https://kanmani.xyz/claim/143_10180_0x103040545AC5031A11E8C03dd11324C7333a13C7_2",
+      "checkedAt": "2026-10-05T15:33:14Z",
+      "recordingTx": "0xa1910ac89e365a0c171f5fbdc74c70386e81d0a803ddba9b2b0953bd8271e641",
+      "evidenceUrl": "https://execution.market/feedback/89427f4a-2dee-4420-a08f-c94a160ab17d/agent_rating_1787417188.json",
+      "recordingBlock": 98243979,
+      "evidenceBytes": 814,
+      "evidenceKeccak": "0x604ff60fdd8d06b62c3dda85a210a7324fec9dbafafdc68d9a08f8960d36bec8",
+      "evidenceHashOnChain": true,
+      "declaredNetwork": "monad",
+      "citedTx": "0xea439ee64fcad0fe33e080e0a018bc9b475be2fb64d9f0f1b17535e176437279",
+      "evidenceComment": "Trato redondo (ciclo 23 min; $0.020 en skale; brief 484 chars): spec clara y completa, pidi\u00f3 evidencia estructurada, ciclo completo en <2h",
+      "search": {
+        "monad": {
+          "result": "not-found",
+          "headBlock": 110788960
+        },
+        "monad-testnet": {
+          "result": "not-found",
+          "headBlock": 68438081
+        },
+        "ethereum": {
+          "result": "not-found",
+          "headBlock": 26127086
+        },
+        "base": {
+          "result": "not-found",
+          "headBlock": 52212525
+        },
+        "optimism": {
+          "result": "not-found",
+          "headBlock": 157807810
+        },
+        "arbitrum": {
+          "result": "not-found",
+          "headBlock": 511964484
+        },
+        "polygon": {
+          "result": "not-found",
+          "headBlock": 95006164
+        },
+        "bsc": {
+          "result": "not-found",
+          "headBlock": 125892779
+        },
+        "avalanche": {
+          "result": "not-found",
+          "headBlock": 96814449
+        },
+        "linea": {
+          "result": "not-found",
+          "headBlock": 32238827
+        },
+        "scroll": {
+          "result": "not-found",
+          "headBlock": 35284296
+        },
+        "gnosis": {
+          "result": "not-found",
+          "headBlock": 48603174
+        },
+        "celo": {
+          "result": "not-found",
+          "headBlock": 79313635
+        },
+        "blast": {
+          "result": "not-found",
+          "headBlock": 41202291
+        },
+        "mantle": {
+          "result": "not-found",
+          "headBlock": 101542042
+        },
+        "unichain": {
+          "result": "not-found",
+          "headBlock": 60466038
+        },
+        "sonic": {
+          "result": "not-found",
+          "headBlock": 80397529
+        },
+        "zksync-era": {
+          "result": "not-found",
+          "headBlock": 72343507
+        },
+        "sei": {
+          "result": "not-found",
+          "headBlock": 235897539
+        },
+        "hyperevm": {
+          "result": "not-found",
+          "headBlock": 47740423
+        },
+        "skale-europa": {
+          "result": "not-found",
+          "headBlock": 27931557
+        },
+        "skale-calypso": {
+          "result": "not-found",
+          "headBlock": 53582139
+        },
+        "skale-nebula": {
+          "result": "not-found",
+          "headBlock": 51577174
+        },
+        "skale-titan": {
+          "result": "not-found",
+          "headBlock": 10619644
+        },
+        "sepolia": {
+          "result": "not-found",
+          "headBlock": 11849689
+        },
+        "base-sepolia": {
+          "result": "not-found",
+          "headBlock": 47723055
+        },
+        "arbitrum-sepolia": {
+          "result": "not-found",
+          "headBlock": 316063357
+        },
+        "optimism-sepolia": {
+          "result": "not-found",
+          "headBlock": 49705929
+        },
+        "polygon-amoy": {
+          "result": "not-found",
+          "headBlock": 49391964
+        },
+        "bsc-testnet": {
+          "result": "not-found",
+          "headBlock": 135038749
+        },
+        "avalanche-fuji": {
+          "result": "not-found",
+          "headBlock": 59072514
+        }
+      },
+      "verdict": "not-found",
+      "foundOn": {}
+    },
+    {
+      "claim": "143_10180_0x103040545AC5031A11E8C03dd11324C7333a13C7_7",
+      "url": "https://kanmani.xyz/claim/143_10180_0x103040545AC5031A11E8C03dd11324C7333a13C7_7",
+      "checkedAt": "2026-10-05T15:33:21Z",
+      "recordingTx": "0x4342b985367976780327fc7fb2c5a4a82cd84cf3678bf79a136b52470504d0d7",
+      "evidenceUrl": "https://execution.market/feedback/0450aa94-ef3c-44dc-b0a6-2f4d85fb057d/worker_rating_1787549251.json",
+      "recordingBlock": 98675049,
+      "evidenceBytes": 793,
+      "evidenceKeccak": "0x0e354453e44c2365e2a22fb8c37ddd35e8be07ce7a951e28496912d0192365a5",
+      "evidenceHashOnChain": true,
+      "declaredNetwork": "monad",
+      "citedTx": "0xb9883954b2ec5fc8e1eaea09dd2301351e5b936dc373a1350d467389818138a6",
+      "evidenceComment": "Task completed and paid: Buying: screen HL funding ann >100% vs retorno 24h",
+      "search": {
+        "monad": {
+          "result": "not-found",
+          "headBlock": 110788982
+        },
+        "monad-testnet": {
+          "result": "not-found",
+          "headBlock": 68438103
+        },
+        "ethereum": {
+          "result": "not-found",
+          "headBlock": 26127086
+        },
+        "base": {
+          "result": "not-found",
+          "headBlock": 52212528
+        },
+        "optimism": {
+          "result": "not-found",
+          "headBlock": 157807813
+        },
+        "arbitrum": {
+          "result": "not-found",
+          "headBlock": 511964510
+        },
+        "polygon": {
+          "result": "not-found",
+          "headBlock": 95006320,
+          "via": "https://polygon.drpc.org"
+        },
+        "bsc": {
+          "result": "not-found",
+          "headBlock": 125892794
+        },
+        "avalanche": {
+          "result": "not-found",
+          "headBlock": 96814452
+        },
+        "linea": {
+          "result": "not-found",
+          "headBlock": 32238828
+        },
+        "scroll": {
+          "result": "not-found",
+          "headBlock": 35284298
+        },
+        "gnosis": {
+          "result": "not-found",
+          "headBlock": 48603175
+        },
+        "celo": {
+          "result": "not-found",
+          "headBlock": 79313644
+        },
+        "blast": {
+          "result": "not-found",
+          "headBlock": 41202294
+        },
+        "mantle": {
+          "result": "not-found",
+          "headBlock": 101542045
+        },
+        "unichain": {
+          "result": "not-found",
+          "headBlock": 60466045
+        },
+        "sonic": {
+          "result": "not-found",
+          "headBlock": 80397542
+        },
+        "zksync-era": {
+          "result": "not-found",
+          "headBlock": 72343509
+        },
+        "sei": {
+          "result": "not-found",
+          "headBlock": 235897553
+        },
+        "hyperevm": {
+          "result": "not-found",
+          "headBlock": 47740430
+        },
+        "skale-europa": {
+          "result": "not-found",
+          "headBlock": 27931558
+        },
+        "skale-calypso": {
+          "result": "not-found",
+          "headBlock": 53582144
+        },
+        "skale-nebula": {
+          "result": "not-found",
+          "headBlock": 51577178
+        },
+        "skale-titan": {
+          "result": "not-found",
+          "headBlock": 10619645
+        },
+        "sepolia": {
+          "result": "not-found",
+          "headBlock": 11849690
+        },
+        "base-sepolia": {
+          "result": "not-found",
+          "headBlock": 47723059
+        },
+        "arbitrum-sepolia": {
+          "result": "not-found",
+          "headBlock": 316063388
+        },
+        "optimism-sepolia": {
+          "result": "not-found",
+          "headBlock": 49705933
+        },
+        "polygon-amoy": {
+          "result": "not-found",
+          "headBlock": 49391971
+        },
+        "bsc-testnet": {
+          "result": "not-found",
+          "headBlock": 135038764
+        },
+        "avalanche-fuji": {
+          "result": "not-found",
+          "headBlock": 59072517
+        }
+      },
+      "verdict": "not-found",
+      "foundOn": {}
+    },
+    {
+      "claim": "143_10181_0x103040545AC5031A11E8C03dd11324C7333a13C7_10",
+      "url": "https://kanmani.xyz/claim/143_10181_0x103040545AC5031A11E8C03dd11324C7333a13C7_10",
+      "checkedAt": "2026-10-05T15:33:45Z",
+      "recordingTx": "0x938b015d824100a2726f5654710b0e83b96bf6735d43ae59a87b5955d1f67bb3",
+      "evidenceUrl": "https://execution.market/feedback/64681323-f6e6-47b3-baad-c1804370b26c/worker_rating_1786382909.json",
+      "recordingBlock": 94834884,
+      "evidenceBytes": 657,
+      "evidenceKeccak": "0xd777c3bfa7448f3c05be9d238a2ad6ec4120782acf044bbc80fbe62eb5cb1661",
+      "evidenceHashOnChain": true,
+      "declaredNetwork": "monad",
+      "citedTx": "0xe9e56d60d6da5f0de72e9fcdeae7b74a4c9b0bb6dddbb1b85b8081b41605958c",
+      "evidenceComment": "Task completed and paid: Buying: Skale DeFi ecosystem snapshot \u2014 top protoc",
+      "search": {
+        "monad": {
+          "result": "not-found",
+          "headBlock": 110789062
+        },
+        "monad-testnet": {
+          "result": "not-found",
+          "headBlock": 68438182
+        },
+        "ethereum": {
+          "result": "not-found",
+          "headBlock": 26127088
+        },
+        "base": {
+          "result": "not-found",
+          "headBlock": 52212540
+        },
+        "optimism": {
+          "result": "not-found",
+          "headBlock": 157807825
+        },
+        "arbitrum": {
+          "result": "not-found",
+          "headBlock": 511964601
+        },
+        "polygon": {
+          "result": "not-found",
+          "headBlock": 95006184
+        },
+        "bsc": {
+          "result": "not-found",
+          "headBlock": 125892847
+        },
+        "avalanche": {
+          "result": "not-found",
+          "headBlock": 96814476
+        },
+        "linea": {
+          "result": "not-found",
+          "headBlock": 32238832
+        },
+        "scroll": {
+          "result": "not-found",
+          "headBlock": 35284300
+        },
+        "gnosis": {
+          "result": "not-found",
+          "headBlock": 48603180
+        },
+        "celo": {
+          "result": "not-found",
+          "headBlock": 79313668
+        },
+        "blast": {
+          "result": "not-found",
+          "headBlock": 41202306
+        },
+        "mantle": {
+          "result": "not-found",
+          "headBlock": 101542058
+        },
+        "unichain": {
+          "result": "not-found",
+          "headBlock": 60466069
+        },
+        "sonic": {
+          "result": "not-found",
+          "headBlock": 80397589
+        },
+        "zksync-era": {
+          "result": "not-found",
+          "headBlock": 72343522
+        },
+        "sei": {
+          "result": "not-found",
+          "headBlock": 235897602
+        },
+        "hyperevm": {
+          "result": "not-found",
+          "headBlock": 47740454
+        },
+        "skale-europa": {
+          "result": "not-found",
+          "headBlock": 27931561
+        },
+        "skale-calypso": {
+          "result": "not-found",
+          "headBlock": 53582160
+        },
+        "skale-nebula": {
+          "result": "not-found",
+          "headBlock": 51577196
+        },
+        "skale-titan": {
+          "result": "not-found",
+          "headBlock": 10619647
+        },
+        "sepolia": {
+          "result": "not-found",
+          "headBlock": 11849692
+        },
+        "base-sepolia": {
+          "result": "not-found",
+          "headBlock": 47723070
+        },
+        "arbitrum-sepolia": {
+          "result": "not-found",
+          "headBlock": 316063480
+        },
+        "optimism-sepolia": {
+          "result": "not-found",
+          "headBlock": 49705944
+        },
+        "polygon-amoy": {
+          "result": "not-found",
+          "headBlock": 49391995
+        },
+        "bsc-testnet": {
+          "result": "not-found",
+          "headBlock": 135038818
+        },
+        "avalanche-fuji": {
+          "result": "not-found",
+          "headBlock": 59072531
+        }
+      },
+      "verdict": "not-found",
+      "foundOn": {}
+    },
+    {
+      "claim": "143_10181_0x103040545AC5031A11E8C03dd11324C7333a13C7_11",
+      "url": "https://kanmani.xyz/claim/143_10181_0x103040545AC5031A11E8C03dd11324C7333a13C7_11",
+      "checkedAt": "2026-10-05T15:33:51Z",
+      "recordingTx": "0x5830b8acdfdccd1b656a861bd6a4bcd71d8fad37116e3e1fb515ba997f103e6f",
+      "evidenceUrl": "https://execution.market/feedback/76b55a24-a221-4f43-96d1-30cb8be0d163/worker_rating_1786383476.json",
+      "recordingBlock": 94836762,
+      "evidenceBytes": 650,
+      "evidenceKeccak": "0xf71bebda2506c22722e41592b55450f10428d2a2397f849f56330d143691e26c",
+      "evidenceHashOnChain": true,
+      "declaredNetwork": "monad",
+      "citedTx": "0x71fbe8a5e69c3f2b2edc8097869704e64019a9f110025c42611bfb610f438f00",
+      "evidenceComment": "Task completed and paid: Buying: Polygon V3 DAI vs USDC structural RF gap \u2014",
+      "search": {
+        "monad": {
+          "result": "not-found",
+          "headBlock": 110789086
+        },
+        "monad-testnet": {
+          "result": "not-found",
+          "headBlock": 68438204
+        },
+        "ethereum": {
+          "result": "not-found",
+          "headBlock": 26127089
+        },
+        "base": {
+          "result": "not-found",
+          "headBlock": 52212543
+        },
+        "optimism": {
+          "result": "not-found",
+          "headBlock": 157807829
+        },
+        "arbitrum": {
+          "result": "not-found",
+          "headBlock": 511964625
+        },
+        "polygon": {
+          "result": "not-found",
+          "headBlock": 95006320,
+          "via": "https://polygon.drpc.org"
+        },
+        "bsc": {
+          "result": "not-found",
+          "headBlock": 125892861
+        },
+        "avalanche": {
+          "result": "not-found",
+          "headBlock": 96814483
+        },
+        "linea": {
+          "result": "not-found",
+          "headBlock": 32238833
+        },
+        "scroll": {
+          "result": "not-found",
+          "headBlock": 35284301
+        },
+        "gnosis": {
+          "result": "not-found",
+          "headBlock": 48603181
+        },
+        "celo": {
+          "result": "not-found",
+          "headBlock": 79313675
+        },
+        "blast": {
+          "result": "not-found",
+          "headBlock": 41202309
+        },
+        "mantle": {
+          "result": "not-found",
+          "headBlock": 101542061
+        },
+        "unichain": {
+          "result": "not-found",
+          "headBlock": 60466076
+        },
+        "sonic": {
+          "result": "not-found",
+          "headBlock": 80397599
+        },
+        "zksync-era": {
+          "result": "not-found",
+          "headBlock": 72343523
+        },
+        "sei": {
+          "result": "not-found",
+          "headBlock": 235897615
+        },
+        "hyperevm": {
+          "result": "not-found",
+          "headBlock": 47740460
+        },
+        "skale-europa": {
+          "result": "not-found",
+          "headBlock": 27931563
+        },
+        "skale-calypso": {
+          "result": "not-found",
+          "headBlock": 53582164
+        },
+        "skale-nebula": {
+          "result": "not-found",
+          "headBlock": 51577202
+        },
+        "skale-titan": {
+          "result": "not-found",
+          "headBlock": 10619647
+        },
+        "sepolia": {
+          "result": "not-found",
+          "headBlock": 11849692
+        },
+        "base-sepolia": {
+          "result": "not-found",
+          "headBlock": 47723074
+        },
+        "arbitrum-sepolia": {
+          "result": "not-found",
+          "headBlock": 316063509
+        },
+        "optimism-sepolia": {
+          "result": "not-found",
+          "headBlock": 49705948
+        },
+        "polygon-amoy": {
+          "result": "not-found",
+          "headBlock": 49392003
+        },
+        "bsc-testnet": {
+          "result": "not-found",
+          "headBlock": 135038834
+        },
+        "avalanche-fuji": {
+          "result": "not-found",
+          "headBlock": 59072534
+        }
+      },
+      "verdict": "not-found",
+      "foundOn": {}
+    },
+    {
+      "claim": "143_10182_0x09C32b8FC0a94A1EeD424499A42180e29667bEeE_4",
+      "url": "https://kanmani.xyz/claim/143_10182_0x09C32b8FC0a94A1EeD424499A42180e29667bEeE_4",
+      "checkedAt": "2026-10-05T15:34:15Z",
+      "recordingTx": "0xbe58d124434fa31f97f36329a8042575ef27d951312ae4ec4c7373d2e6c0e1cb",
+      "evidenceUrl": "https://execution.market/feedback/42b72fe7-32ee-4c5a-8865-7f9cb50e236a/executor_rates_requester_1790536593.json",
+      "recordingBlock": 108546342,
+      "evidenceBytes": 936,
+      "evidenceKeccak": "0x55b42c779e84b0c686063e0c8416864776d737a4c3c18605eef40451c79a1439",
+      "evidenceHashOnChain": true,
+      "declaredNetwork": "monad",
+      "citedTx": "0x75d464eb1880e3eb2e3c7526c2e2f89d7cfd21f1fc67041b13f8d066fae3730a",
+      "evidenceComment": "Backfill firmado (cumpli\u00f3 los 6 criterios: escrow, liquidaci\u00f3n, sin reembolso, pago sobre el piso,)",
+      "search": {
+        "monad": {
+          "result": "not-found",
+          "headBlock": 110789162
+        },
+        "monad-testnet": {
+          "result": "not-found",
+          "headBlock": 68438283
+        },
+        "ethereum": {
+          "result": "not-found",
+          "headBlock": 26127091
+        },
+        "base": {
+          "result": "not-found",
+          "headBlock": 52212555
+        },
+        "optimism": {
+          "result": "not-found",
+          "headBlock": 157807840
+        },
+        "arbitrum": {
+          "result": "not-found",
+          "headBlock": 511964719
+        },
+        "polygon": {
+          "result": "not-found",
+          "headBlock": 95006320,
+          "via": "https://polygon.drpc.org"
+        },
+        "bsc": {
+          "result": "not-found",
+          "headBlock": 125892914
+        },
+        "avalanche": {
+          "result": "not-found",
+          "headBlock": 96814507
+        },
+        "linea": {
+          "result": "not-found",
+          "headBlock": 32238839
+        },
+        "scroll": {
+          "result": "not-found",
+          "headBlock": 35284303
+        },
+        "gnosis": {
+          "result": "not-found",
+          "headBlock": 48603185
+        },
+        "celo": {
+          "result": "found",
+          "block": 75452874,
+          "from": "0x103040545ac5031a11e8c03dd11324c7333a13c7",
+          "to": "0xc2377a9db1de2520bd6b2756ed012f4e82f7938e",
+          "headBlock": 79313699
+        },
+        "blast": {
+          "result": "not-found",
+          "headBlock": 41202321
+        },
+        "mantle": {
+          "result": "not-found",
+          "headBlock": 101542073
+        },
+        "unichain": {
+          "result": "not-found",
+          "headBlock": 60466099
+        },
+        "sonic": {
+          "result": "not-found",
+          "headBlock": 80397641
+        },
+        "zksync-era": {
+          "result": "not-found",
+          "headBlock": 72343529
+        },
+        "sei": {
+          "result": "not-found",
+          "headBlock": 235897666
+        },
+        "hyperevm": {
+          "result": "not-found",
+          "headBlock": 47740485
+        },
+        "skale-europa": {
+          "result": "not-found",
+          "headBlock": 27931575
+        },
+        "skale-calypso": {
+          "result": "not-found",
+          "headBlock": 53582179
+        },
+        "skale-nebula": {
+          "result": "not-found",
+          "headBlock": 51577222
+        },
+        "skale-titan": {
+          "result": "not-found",
+          "headBlock": 10619649
+        },
+        "sepolia": {
+          "result": "not-found",
+          "headBlock": 11849694
+        },
+        "base-sepolia": {
+          "result": "not-found",
+          "headBlock": 47723085
+        },
+        "arbitrum-sepolia": {
+          "result": "not-found",
+          "headBlock": 316063600
+        },
+        "optimism-sepolia": {
+          "result": "not-found",
+          "headBlock": 49705960
+        },
+        "polygon-amoy": {
+          "result": "not-found",
+          "headBlock": 49392025
+        },
+        "bsc-testnet": {
+          "result": "not-found",
+          "headBlock": 135038885
+        },
+        "avalanche-fuji": {
+          "result": "not-found",
+          "headBlock": 59072542
+        }
+      },
+      "verdict": "found",
+      "foundOn": {
+        "celo": {
+          "result": "found",
+          "block": 75452874,
+          "from": "0x103040545ac5031a11e8c03dd11324c7333a13c7",
+          "to": "0xc2377a9db1de2520bd6b2756ed012f4e82f7938e",
+          "headBlock": 79313699
+        }
+      }
+    },
+    {
+      "claim": "143_10182_0x103040545AC5031A11E8C03dd11324C7333a13C7_4",
+      "url": "https://kanmani.xyz/claim/143_10182_0x103040545AC5031A11E8C03dd11324C7333a13C7_4",
+      "checkedAt": "2026-10-05T15:34:39Z",
+      "recordingTx": "0x6d33b7722c1e585bcb9d7a37e8471b84164949668e124d814287b1393f4038f5",
+      "evidenceUrl": "https://execution.market/feedback/42b72fe7-32ee-4c5a-8865-7f9cb50e236a/agent_rating_1787353921.json",
+      "recordingBlock": 98034546,
+      "evidenceBytes": 813,
+      "evidenceKeccak": "0x6ccb3db94597287100b5b30af2cc6b973bbd1af82bf828f324a81bb2db1a243a",
+      "evidenceHashOnChain": true,
+      "declaredNetwork": "monad",
+      "citedTx": "0x75d464eb1880e3eb2e3c7526c2e2f89d7cfd21f1fc67041b13f8d066fae3730a",
+      "evidenceComment": "Trato redondo (ciclo 71 min; $0.020 en celo; brief 483 chars): spec clara y completa, pidi\u00f3 evidencia estructurada, ciclo completo en <2h",
+      "search": {
+        "monad": {
+          "result": "not-found",
+          "headBlock": 110789246
+        },
+        "monad-testnet": {
+          "result": "not-found",
+          "headBlock": 68438363
+        },
+        "ethereum": {
+          "result": "not-found",
+          "headBlock": 26127093
+        },
+        "base": {
+          "result": "not-found",
+          "headBlock": 52212567
+        },
+        "optimism": {
+          "result": "not-found",
+          "headBlock": 157807853
+        },
+        "arbitrum": {
+          "result": "not-found",
+          "headBlock": 511964809
+        },
+        "polygon": {
+          "result": "not-found",
+          "headBlock": 95006320,
+          "via": "https://polygon.drpc.org"
+        },
+        "bsc": {
+          "result": "not-found",
+          "headBlock": 125892968
+        },
+        "avalanche": {
+          "result": "not-found",
+          "headBlock": 96814528
+        },
+        "linea": {
+          "result": "not-found",
+          "headBlock": 32238844
+        },
+        "scroll": {
+          "result": "not-found",
+          "headBlock": 35284318
+        },
+        "gnosis": {
+          "result": "not-found",
+          "headBlock": 48603190
+        },
+        "celo": {
+          "result": "found",
+          "block": 75452874,
+          "from": "0x103040545ac5031a11e8c03dd11324c7333a13c7",
+          "to": "0xc2377a9db1de2520bd6b2756ed012f4e82f7938e",
+          "headBlock": 79313722
+        },
+        "blast": {
+          "result": "not-found",
+          "headBlock": 41202334
+        },
+        "mantle": {
+          "result": "not-found",
+          "headBlock": 101542085
+        },
+        "unichain": {
+          "result": "not-found",
+          "headBlock": 60466124
+        },
+        "sonic": {
+          "result": "not-found",
+          "headBlock": 80397669
+        },
+        "zksync-era": {
+          "result": "not-found",
+          "headBlock": 72343544
+        },
+        "sei": {
+          "result": "not-found",
+          "headBlock": 235897715
+        },
+        "hyperevm": {
+          "result": "not-found",
+          "headBlock": 47740509
+        },
+        "skale-europa": {
+          "result": "not-found",
+          "headBlock": 27931579
+        },
+        "skale-calypso": {
+          "result": "not-found",
+          "headBlock": 53582196
+        },
+        "skale-nebula": {
+          "result": "not-found",
+          "headBlock": 51577239
+        },
+        "skale-titan": {
+          "result": "not-found",
+          "headBlock": 10619651
+        },
+        "sepolia": {
+          "result": "not-found",
+          "headBlock": 11849696
+        },
+        "base-sepolia": {
+          "result": "not-found",
+          "headBlock": 47723098
+        },
+        "arbitrum-sepolia": {
+          "result": "not-found",
+          "headBlock": 316063696
+        },
+        "optimism-sepolia": {
+          "result": "not-found",
+          "headBlock": 49705972
+        },
+        "polygon-amoy": {
+          "result": "not-found",
+          "headBlock": 49392051
+        },
+        "bsc-testnet": {
+          "result": "not-found",
+          "headBlock": 135038941
+        },
+        "avalanche-fuji": {
+          "result": "not-found",
+          "headBlock": 59072550
+        }
+      },
+      "verdict": "found",
+      "foundOn": {
+        "celo": {
+          "result": "found",
+          "block": 75452874,
+          "from": "0x103040545ac5031a11e8c03dd11324c7333a13c7",
+          "to": "0xc2377a9db1de2520bd6b2756ed012f4e82f7938e",
+          "headBlock": 79313722
+        }
+      }
+    },
+    {
+      "claim": "143_10182_0x103040545AC5031A11E8C03dd11324C7333a13C7_30",
+      "url": "https://kanmani.xyz/claim/143_10182_0x103040545AC5031A11E8C03dd11324C7333a13C7_30",
+      "checkedAt": "2026-10-05T15:35:03Z",
+      "recordingTx": "0x205f1d06384a01edfada535e5e35c9ca63512c96ee65e5aa6a92643649caf31f",
+      "evidenceUrl": "https://execution.market/feedback/9391d4de-36db-4be1-b5ec-539b516a05f7/worker_rating_1788227311.json",
+      "recordingBlock": 100914979,
+      "evidenceBytes": 929,
+      "evidenceKeccak": "0x98aa80b9911cf5a2e5cac32e2a1d97990bf2fc155020e6577fa26911252349fc",
+      "evidenceHashOnChain": true,
+      "declaredNetwork": "monad",
+      "citedTx": "0x312608e3ad434c0209803e125dd27005c59a5548a30284e6a8e67cf2dfb492cc",
+      "evidenceComment": "Submision verificada por arbitro B/89, evidencia cita task_ids reales y tx refs del canal. Diagnostico solido del patron \u00b7 faltan claves pedidas: optional, required \u00b7 claves: casos_reportados_en_canal",
+      "search": {
+        "monad": {
+          "result": "not-found",
+          "headBlock": 110789324
+        },
+        "monad-testnet": {
+          "result": "not-found",
+          "headBlock": 68438445
+        },
+        "ethereum": {
+          "result": "not-found",
+          "headBlock": 26127095
+        },
+        "base": {
+          "result": "not-found",
+          "headBlock": 52212580
+        },
+        "optimism": {
+          "result": "not-found",
+          "headBlock": 157807865
+        },
+        "arbitrum": {
+          "result": "not-found",
+          "headBlock": 511964904
+        },
+        "polygon": {
+          "result": "not-found",
+          "headBlock": 95006238
+        },
+        "bsc": {
+          "result": "not-found",
+          "headBlock": 125893023
+        },
+        "avalanche": {
+          "result": "not-found",
+          "headBlock": 96814547
+        },
+        "linea": {
+          "result": "not-found",
+          "headBlock": 32238848
+        },
+        "scroll": {
+          "result": "not-found",
+          "headBlock": 35284326
+        },
+        "gnosis": {
+          "result": "not-found",
+          "headBlock": 48603195
+        },
+        "celo": {
+          "result": "not-found",
+          "headBlock": 79313746
+        },
+        "blast": {
+          "result": "not-found",
+          "headBlock": 41202346
+        },
+        "mantle": {
+          "result": "not-found",
+          "headBlock": 101542097
+        },
+        "unichain": {
+          "result": "not-found",
+          "headBlock": 60466148
+        },
+        "sonic": {
+          "result": "not-found",
+          "headBlock": 80397704
+        },
+        "zksync-era": {
+          "result": "not-found",
+          "headBlock": 72343550
+        },
+        "sei": {
+          "result": "not-found",
+          "headBlock": 235897769
+        },
+        "hyperevm": {
+          "result": "not-found",
+          "headBlock": 47740535
+        },
+        "skale-europa": {
+          "result": "not-found",
+          "headBlock": 27931582
+        },
+        "skale-calypso": {
+          "result": "not-found",
+          "headBlock": 53582212
+        },
+        "skale-nebula": {
+          "result": "not-found",
+          "headBlock": 51577257
+        },
+        "skale-titan": {
+          "result": "not-found",
+          "headBlock": 10619654
+        },
+        "sepolia": {
+          "result": "not-found",
+          "headBlock": 11849698
+        },
+        "base-sepolia": {
+          "result": "not-found",
+          "headBlock": 47723110
+        },
+        "arbitrum-sepolia": {
+          "result": "not-found",
+          "headBlock": 316063794
+        },
+        "optimism-sepolia": {
+          "result": "not-found",
+          "headBlock": 49705984
+        },
+        "polygon-amoy": {
+          "result": "not-found",
+          "headBlock": 49392074
+        },
+        "bsc-testnet": {
+          "result": "not-found",
+          "headBlock": 135038994
+        },
+        "avalanche-fuji": {
+          "result": "not-found",
+          "headBlock": 59072563
+        }
+      },
+      "verdict": "not-found",
+      "foundOn": {}
+    },
+    {
+      "claim": "143_10182_0x103040545AC5031A11E8C03dd11324C7333a13C7_33",
+      "url": "https://kanmani.xyz/claim/143_10182_0x103040545AC5031A11E8C03dd11324C7333a13C7_33",
+      "checkedAt": "2026-10-05T15:35:10Z",
+      "recordingTx": "0x67c98ca7c63e93bdd821b761892b0382089c8f61aa984a7c74883b311469a503",
+      "evidenceUrl": "https://execution.market/feedback/cc2c1e52-03ba-4343-a0a8-c536f766f35b/worker_rating_1788467180.json",
+      "recordingBlock": 101709542,
+      "evidenceBytes": 933,
+      "evidenceKeccak": "0xf207557837641726bb1c8869f585d6f46a0879ede960fa4ba21f91ac55bac7a0",
+      "evidenceHashOnChain": true,
+      "declaredNetwork": "monad",
+      "citedTx": "0xd20d2685e75ea1182aaf618c4f51b2a6e8afa0e511afae48536e4ca6655ad86d",
+      "evidenceComment": "Entrega honesta: DefiLlama trunc\u00f3 el dump, USDC vaults de Morpho Blue no aparecieron en top 1000 pools. Worker trajo lo  \u00b7 faltan claves pedidas: optional, required \u00b7 claves: base_morpho_blue_vaults, ",
+      "search": {
+        "monad": {
+          "result": "not-found",
+          "headBlock": 110789344
+        },
+        "monad-testnet": {
+          "result": "not-found",
+          "headBlock": 68438464
+        },
+        "ethereum": {
+          "result": "not-found",
+          "headBlock": 26127096
+        },
+        "base": {
+          "result": "not-found",
+          "headBlock": 52212583
+        },
+        "optimism": {
+          "result": "not-found",
+          "headBlock": 157807868
+        },
+        "arbitrum": {
+          "result": "not-found",
+          "headBlock": 511964927
+        },
+        "polygon": {
+          "result": "not-found",
+          "headBlock": 95006241
+        },
+        "bsc": {
+          "result": "not-found",
+          "headBlock": 125893036
+        },
+        "avalanche": {
+          "result": "not-found",
+          "headBlock": 96814553
+        },
+        "linea": {
+          "result": "not-found",
+          "headBlock": 32238848
+        },
+        "scroll": {
+          "result": "not-found",
+          "headBlock": 35284328
+        },
+        "gnosis": {
+          "result": "not-found",
+          "headBlock": 48603196
+        },
+        "celo": {
+          "result": "not-found",
+          "headBlock": 79313754
+        },
+        "blast": {
+          "result": "not-found",
+          "headBlock": 41202348
+        },
+        "mantle": {
+          "result": "not-found",
+          "headBlock": 101542100
+        },
+        "unichain": {
+          "result": "not-found",
+          "headBlock": 60466154
+        },
+        "sonic": {
+          "result": "not-found",
+          "headBlock": 80397713
+        },
+        "zksync-era": {
+          "result": "not-found",
+          "headBlock": 72343550
+        },
+        "sei": {
+          "result": "not-found",
+          "headBlock": 235897780
+        },
+        "hyperevm": {
+          "result": "not-found",
+          "headBlock": 47740541
+        },
+        "skale-europa": {
+          "result": "not-found",
+          "headBlock": 27931584
+        },
+        "skale-calypso": {
+          "result": "not-found",
+          "headBlock": 53582215
+        },
+        "skale-nebula": {
+          "result": "not-found",
+          "headBlock": 51577262
+        },
+        "skale-titan": {
+          "result": "not-found",
+          "headBlock": 10619654
+        },
+        "sepolia": {
+          "result": "not-found",
+          "headBlock": 11849699
+        },
+        "base-sepolia": {
+          "result": "not-found",
+          "headBlock": 47723113
+        },
+        "arbitrum-sepolia": {
+          "result": "not-found",
+          "headBlock": 316063817
+        },
+        "optimism-sepolia": {
+          "result": "not-found",
+          "headBlock": 49705987
+        },
+        "polygon-amoy": {
+          "result": "not-found",
+          "headBlock": 49392080
+        },
+        "bsc-testnet": {
+          "result": "not-found",
+          "headBlock": 135039007
+        },
+        "avalanche-fuji": {
+          "result": "not-found",
+          "headBlock": 59072564
+        }
+      },
+      "verdict": "not-found",
+      "foundOn": {}
+    },
+    {
+      "claim": "143_10182_0x103040545AC5031A11E8C03dd11324C7333a13C7_36",
+      "url": "https://kanmani.xyz/claim/143_10182_0x103040545AC5031A11E8C03dd11324C7333a13C7_36",
+      "checkedAt": "2026-10-05T15:35:18Z",
+      "recordingTx": "0x5e9cb06762762cfa0d7feb415a9be49b9babd1e9406a1f429f847f23906c357f",
+      "evidenceUrl": "https://execution.market/feedback/46456cb6-33a6-4df9-9f98-8342abb52a82/worker_rating_1788810994.json",
+      "recordingBlock": 102842416,
+      "evidenceBytes": 929,
+      "evidenceKeccak": "0x533c639e2f59b5c39f7b9bd5ac62834980f9f9ac03709b29c65c6cacba2c44e1",
+      "evidenceHashOnChain": true,
+      "declaredNetwork": "monad",
+      "citedTx": "0xa9f11fbeadcd6d99b460ece6aa4f6ec2fae1a22a487c367611e2dc68354c6fb2",
+      "evidenceComment": "datbo0i_lp hizo el trabajo honesto: probo ESPN (403), ProFootballRef (Cloudflare), TheSportsDB, x402 (muy caro), y Sleep \u00b7 faltan claves pedidas: optional, required \u00b7 claves: available_when, current_w",
+      "search": {
+        "monad": {
+          "result": "not-found",
+          "headBlock": 110789375
+        },
+        "monad-testnet": {
+          "result": "not-found",
+          "headBlock": 68438496
+        },
+        "ethereum": {
+          "result": "not-found",
+          "headBlock": 26127096
+        },
+        "base": {
+          "result": "not-found",
+          "headBlock": 52212588
+        },
+        "optimism": {
+          "result": "not-found",
+          "headBlock": 157807873
+        },
+        "arbitrum": {
+          "result": "not-found",
+          "headBlock": 511964963
+        },
+        "polygon": {
+          "result": "not-found",
+          "headBlock": 95006248
+        },
+        "bsc": {
+          "result": "not-found",
+          "headBlock": 125893057
+        },
+        "avalanche": {
+          "result": "not-found",
+          "headBlock": 96814560
+        },
+        "linea": {
+          "result": "not-found",
+          "headBlock": 32238851
+        },
+        "scroll": {
+          "result": "not-found",
+          "headBlock": 35284329
+        },
+        "gnosis": {
+          "result": "not-found",
+          "headBlock": 48603197
+        },
+        "celo": {
+          "result": "not-found",
+          "headBlock": 79313763
+        },
+        "blast": {
+          "result": "not-found",
+          "headBlock": 41202353
+        },
+        "mantle": {
+          "result": "not-found",
+          "headBlock": 101542105
+        },
+        "unichain": {
+          "result": "not-found",
+          "headBlock": 60466164
+        },
+        "sonic": {
+          "result": "not-found",
+          "headBlock": 80397720
+        },
+        "zksync-era": {
+          "result": "not-found",
+          "headBlock": 72343553
+        },
+        "sei": {
+          "result": "not-found",
+          "headBlock": 235897801
+        },
+        "hyperevm": {
+          "result": "not-found",
+          "headBlock": 47740550
+        },
+        "skale-europa": {
+          "result": "not-found",
+          "headBlock": 27931585
+        },
+        "skale-calypso": {
+          "result": "not-found",
+          "headBlock": 53582222
+        },
+        "skale-nebula": {
+          "result": "not-found",
+          "headBlock": 51577270
+        },
+        "skale-titan": {
+          "result": "not-found",
+          "headBlock": 10619655
+        },
+        "sepolia": {
+          "result": "not-found",
+          "headBlock": 11849699
+        },
+        "base-sepolia": {
+          "result": "not-found",
+          "headBlock": 47723118
+        },
+        "arbitrum-sepolia": {
+          "result": "not-found",
+          "headBlock": 316063855
+        },
+        "optimism-sepolia": {
+          "result": "not-found",
+          "headBlock": 49705992
+        },
+        "polygon-amoy": {
+          "result": "not-found",
+          "headBlock": 49392090
+        },
+        "bsc-testnet": {
+          "result": "not-found",
+          "headBlock": 135039027
+        },
+        "avalanche-fuji": {
+          "result": "not-found",
+          "headBlock": 59072567
+        }
+      },
+      "verdict": "not-found",
+      "foundOn": {}
+    },
+    {
+      "claim": "143_10221_0x103040545AC5031A11E8C03dd11324C7333a13C7_1",
+      "url": "https://kanmani.xyz/claim/143_10221_0x103040545AC5031A11E8C03dd11324C7333a13C7_1",
+      "checkedAt": "2026-10-05T15:35:41Z",
+      "recordingTx": "0x889e09b443bb43257e2a4b570c4f319fa98ede24d1a876b0467af0c397f95eb2",
+      "evidenceUrl": "https://execution.market/feedback/593ce93b-1fac-4029-b4f6-3fde0322b0d4/worker_rating_1788988969.json",
+      "recordingBlock": 103431194,
+      "evidenceBytes": 929,
+      "evidenceKeccak": "0x15a67672780960d5c335282cbbf3599600e3f48a576a849adb83e2901912c553",
+      "evidenceHashOnChain": true,
+      "declaredNetwork": "monad",
+      "citedTx": "0x5055ee69f321b1defb1bf0dd60c53d9f18d2dbcf700e3099609927980312f8c2",
+      "evidenceComment": "solid recovery playbook with real scenarios for ghosted accepted tasks, arbiter B/89 confirm. covers both circular (x402 \u00b7 faltan claves pedidas: optional, required \u00b7 claves: buyer_scenarios, key_insi",
+      "search": {
+        "monad": {
+          "result": "not-found",
+          "headBlock": 110789445
+        },
+        "monad-testnet": {
+          "result": "not-found",
+          "headBlock": 68438566
+        },
+        "ethereum": {
+          "result": "not-found",
+          "headBlock": 26127098
+        },
+        "base": {
+          "result": "not-found",
+          "headBlock": 52212598
+        },
+        "optimism": {
+          "result": "not-found",
+          "headBlock": 157807883
+        },
+        "arbitrum": {
+          "result": "not-found",
+          "headBlock": 511965047
+        },
+        "polygon": {
+          "result": "not-found",
+          "headBlock": 95006320,
+          "via": "https://polygon.drpc.org"
+        },
+        "bsc": {
+          "result": "not-found",
+          "headBlock": 125893104
+        },
+        "avalanche": {
+          "result": "not-found",
+          "headBlock": 96814580
+        },
+        "linea": {
+          "result": "not-found",
+          "headBlock": 32238856
+        },
+        "scroll": {
+          "result": "not-found",
+          "headBlock": 35284334
+        },
+        "gnosis": {
+          "result": "not-found",
+          "headBlock": 48603201
+        },
+        "celo": {
+          "result": "not-found",
+          "headBlock": 79313783
+        },
+        "blast": {
+          "result": "not-found",
+          "headBlock": 41202364
+        },
+        "mantle": {
+          "result": "not-found",
+          "headBlock": 101542115
+        },
+        "unichain": {
+          "result": "not-found",
+          "headBlock": 60466185
+        },
+        "sonic": {
+          "result": "not-found",
+          "headBlock": 80397740
+        },
+        "zksync-era": {
+          "result": "not-found",
+          "headBlock": 72343557
+        },
+        "sei": {
+          "result": "not-found",
+          "headBlock": 235897845
+        },
+        "hyperevm": {
+          "result": "not-found",
+          "headBlock": 47740572
+        },
+        "skale-europa": {
+          "result": "not-found",
+          "headBlock": 27931588
+        },
+        "skale-calypso": {
+          "result": "not-found",
+          "headBlock": 53582235
+        },
+        "skale-nebula": {
+          "result": "not-found",
+          "headBlock": 51577287
+        },
+        "skale-titan": {
+          "result": "not-found",
+          "headBlock": 10619657
+        },
+        "sepolia": {
+          "result": "not-found",
+          "headBlock": 11849701
+        },
+        "base-sepolia": {
+          "result": "not-found",
+          "headBlock": 47723128
+        },
+        "arbitrum-sepolia": {
+          "result": "not-found",
+          "headBlock": 316063940
+        },
+        "optimism-sepolia": {
+          "result": "not-found",
+          "headBlock": 49706002
+        },
+        "polygon-amoy": {
+          "result": "not-found",
+          "headBlock": 49392111
+        },
+        "bsc-testnet": {
+          "result": "not-found",
+          "headBlock": 135039075
+        },
+        "avalanche-fuji": {
+          "result": "not-found",
+          "headBlock": 59072580
+        }
+      },
+      "verdict": "not-found",
+      "foundOn": {}
+    }
+  ]
+}
