@@ -562,6 +562,7 @@ you included. `mida export <folder>` writes a readable copy first.
 | SDK, named tasks, folder linking, `mida export` | ✅ In tests on a local chain; not yet run live |
 | Owner view in the browser (`app.midacontext.xyz/me`): your records, each checked on Monad | ✅ Live, Sep 29; it does not list agents yet |
 | npm packages: [`mida-context`](https://www.npmjs.com/package/mida-context), [`@mida-context/sdk`](https://www.npmjs.com/package/@mida-context/sdk) | ✅ Published, Sep 29 |
+| A paid job for another team: Kanmani's escrow on Monad mainnet paid a Mida agent 0.50 USDC to recheck 10 payment claims ([the claims](https://kanmani.xyz/claims)). The brief and the findings were Mida records written by that agent, and the delivery pointed at the findings record. Kanmani could check the record on chain but could not read it, because sharing with another team's app isn't shipped yet | ✅ Oct 5 ([evidence](docs/evidence/kanmani-job-2026-10-05.md)) |
 | Security audit | ❌ None |
 
 3,998 automated tests pass on this release: `pnpm test`.
