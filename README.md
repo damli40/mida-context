@@ -466,7 +466,9 @@ their limits, retries a bad answer once, and scrubs secrets from the output agai
 - **The model that writes your summaries sees your scrubbed session text.** A local model keeps it
   on your machine. [Who writes the summaries](#who-writes-the-summaries) names the reader for each
   choice.
-- **Testnet only, not audited.** Do not store anything you cannot afford to lose.
+- **Testnet only, not audited.** Do not store anything you cannot afford to lose. We have asked
+  OpenZeppelin and CertiK for audit quotes; the contracts go to mainnet only after an independent review. We have asked two
+  audit firms for quotes; the contracts go to mainnet only after an independent review.
 
 **What a handoff keeps, and what it leaves out**
 
