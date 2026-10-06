@@ -3,7 +3,7 @@
 **What happened, in one paragraph.** TrustLayer (github.com/Valorian0108/Trustlayer, another Monad Metropolis team)
 runs a `DelegationRegistry` on Monad testnet: an owner records which agent may act for them, at which tier, until
 when. Their builder EquationX agreed on Oct 6 to an integration. Mida built a small agent, kept in a new folder of a
-clone of their repository (`integrations/mida/`, branch `mida-integration`, not yet pushed or merged). Before it does
+clone of their repository (`integrations/mida/`, branch `mida-integration`; TrustLayer merged it into their `main` on Oct 6, PR #2). Before it does
 anything it asks TrustLayer's registry whether the owner delegated to it. It then reads the owner's brief through Mida
 (only a record the chain marks as owner-written counts), pays the amount if it fits the tier, and writes a receipt
 record into Mida, authored by the agent. On Oct 6, between 17:09 and 17:30 WAT, Dami ran it live on Monad testnet:
@@ -13,7 +13,8 @@ yes.
 
 **What it shows, and what it does not.** It shows a Mida agent gated by two independent permissions on Monad:
 another team's registry for what it may *do*, Mida for what it may *know*. Each revoke stopped it on its own. It does
-NOT show TrustLayer's team running or reviewing it yet (the draft PR is not open), their app or its Privy login (the
+NOT show TrustLayer's team running it (they merged it on Oct 6 at 18:38 UTC, merge commit `15b1fe8`, without a
+written review), their app or its Privy login (the
 owner here is a plain key used with `cast`, because their app has no revoke), or their `AuthorizationVerifier` (its
 zero-knowledge step stays simulated in their repo and is not called). TrustLayer cannot read the receipt: on chain
 it can see that a receipt record exists, who wrote it and when, plus a hash of its encrypted content, but linking it
