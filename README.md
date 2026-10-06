@@ -128,6 +128,7 @@ grants the user signed; your app never holds the user's owner keys. Full referen
 - [Security model and limits](#security-model-and-limits)
 - [What it costs to run](#what-it-costs-to-run)
 - [What works and what doesn't](#what-works-and-what-doesnt)
+- [Benchmarks](#benchmarks)
 - [How it scales](#how-it-scales)
 - [Where Mida is going](#where-mida-is-going)
 - [Repository layout](#repository-layout)
@@ -564,9 +565,33 @@ you included. `mida export <folder>` writes a readable copy first.
 | Owner view in the browser (`app.midacontext.xyz/me`): your records, each checked on Monad | ✅ Live, Sep 29; it does not list agents yet |
 | npm packages: [`mida-context`](https://www.npmjs.com/package/mida-context), [`@mida-context/sdk`](https://www.npmjs.com/package/@mida-context/sdk) | ✅ Published, Sep 29 |
 | A paid job for another team: Kanmani's escrow on Monad mainnet paid a Mida agent 0.50 USDC to recheck 10 payment claims ([the claims](https://kanmani.xyz/claims)). The brief and the findings were Mida records written by that agent, and the delivery pointed at the findings record. Kanmani could check the record on chain but could not read it, because sharing with another team's app isn't shipped yet | ✅ Oct 5 ([evidence](docs/evidence/kanmani-job-2026-10-05.md)) |
+| An agent that another team's registry controls: before it pays, a Mida agent checks the `DelegationRegistry` of [TrustLayer](https://github.com/Valorian0108/Trustlayer), another Monad Metropolis team, on Monad testnet. It reads the owner's brief through Mida and writes its receipt as a Mida record. In the live run it paid 0.01 MON once, refused the same brief again, and refused after each revoke: TrustLayer's, then Mida's. Built with the TrustLayer team's agreement; their review is pending | ✅ Oct 6 ([evidence](docs/evidence/trustlayer-integration-2026-10-06.md)) |
 | Security audit | ❌ None |
 
 3,998 automated tests pass on this release: `pnpm test`.
+
+---
+
+## Benchmarks
+
+Each benchmark has a file that gives the method, every run and the limits. All runs used one owner and one
+machine, unless the Sample column gives a different setup. The [evidence index](docs/evidence/README.md) lists
+every file.
+
+| Benchmark | What it measures | Result | Sample |
+|---|---|---|---|
+| [Continuation](docs/evidence/continuation-benchmark-2026-10-02.md), Oct 2 | Agent A stops after step 1 of 5. A new agent gets one word, "Continue." The test measures if the new agent completes the job. | With a Mida handoff, 5 of 5 runs completed the job. With no handoff, 0 of 5 completed. With the full transcript pasted, 5 of 5 completed, because the sessions were short. | 15 runs, 5 for each condition. Two scorers. |
+| [Late change](docs/evidence/late-change-benchmark-2026-10-02.md), Oct 2 | The owner changes one decision in a different agent's session. No file records the change. The test measures if the agent that does the job applies the change. | With Mida, 5 of 5 runs applied the change. With no Mida, 0 of 5. With a transcript pasted at the start, 0 of 5. | 15 runs, 5 for each condition. |
+| [Both benchmarks again](docs/evidence/benchmarks-rerun-2026-10-03.md), Oct 3 | The test runs the two benchmarks again with Mida, after the Oct 3 changes to the summary input. | The results did not change. 5 of 5 runs completed the job, and 5 of 5 applied the late change. | 10 runs, Mida only. |
+| [First "Continue." test](docs/evidence/handoff-design-and-benchmark-2026-09-20.md), Sep 20 | A new Codex gets a job that is half complete and one word, "Continue." The test measures if it completes the job. | With no handoff, 0 of 6 runs completed. In all 6, the tests passed and the agent said that the job was complete. With a Mida handoff, 3 of 3 completed. | 9 runs. |
+| [Change of plan in a session](docs/evidence/live-tests-2026-09-27-to-29.md), Sep 27 to 29 | The owner changes the plan during a session. The test measures if the next agent gets the change, with the owner as its source. | Before the fix, 0 of 6 runs. After the fix, 6 of 6 runs, on a real model. | 12 runs. |
+| [A message typed while Claude Code works](docs/evidence/prov17-queued-message-2026-10-03.md), Oct 3 | The owner types a change while Claude Code works. The test measures if the summary gives the change as the words of the owner. | Before the fix, 0 of 3 runs for each model. After the fix, 3 of 3 runs for each model. | 12 runs: 3 for each build and model (DeepSeek and Claude Haiku). |
+| [Tool output labels](docs/evidence/prov19-tool-output-label-2026-10-04.md), Oct 4 | The test measures if Mida shows tool output to the summary model as the words of the owner. | Before the fix, Mida labelled tool output as the user. The fix changes the label. The summaries did not improve in this test. | 12 runs: 3 for each build and model. |
+| [One session-start read](docs/evidence/session-start-read-2026-10-01/01-session-start-read-busy-project.md), Oct 1 | The test measures the time that Mida needs to load the memory of a project when a session starts. The limit is 7.5 seconds. | With 250 saved sessions, the read took 6.1 seconds (median of 5). Two steps read every checkpoint, so the time increases with each save. | 5 reads. |
+| [Real session starts](docs/evidence/session-start-read-2026-10-01/02-session-start-outcomes.md), Sep 29 to Oct 1 | The test counts the real session starts that loaded their full memory. | 17 of 26 starts loaded all the memory. 3 loaded part of it. 3 stopped at the time limit. 3 had no memory saved for their task. | 26 session starts. |
+| [Handoff read time](docs/evidence/handoff-read-time-2026-10-02.md), Sep 21 to Oct 2 | The test measures the time that a new session waits for its handoff, as the number of saved checkpoints increases. | The read time increased from 3.4 seconds at 26 checkpoints to 6.6 seconds at 334. Mida refused 44 of 196 reads because they were too slow. After the 0.1.2 change, three reads at 298 saves took 6.3, 3.3 and 2.8 seconds. | 196 reads, then 3 reads on a test build. |
+| [Summary models of the agents](docs/evidence/summariser-probe-2026-10-01.md), Oct 1 and 2 | The test measures if the small models of Claude Code and Codex can write the summaries of Mida. | Both models wrote a valid summary with all 10 fields. Claude Haiku took 21 seconds. The Codex model took 35 seconds. | 1 session, 2 models. |
+| [Daily limit of the gas sponsor](docs/evidence/sponsor-daily-limit-2026-10-01.md), Sep 27 to Oct 2 | The test finds why saves stopped before they got to Monad on some days. | The hosted sponsor stopped after approximately 60 saves for one agent in one day. Mida tried each refused save 8 times and then dropped it. | 6 days. |
 
 ---
 
