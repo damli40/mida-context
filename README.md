@@ -467,8 +467,7 @@ their limits, retries a bad answer once, and scrubs secrets from the output agai
   on your machine. [Who writes the summaries](#who-writes-the-summaries) names the reader for each
   choice.
 - **Testnet only, not audited.** Do not store anything you cannot afford to lose. We have asked
-  OpenZeppelin and CertiK for audit quotes; the contracts go to mainnet only after an independent review. We have asked two
-  audit firms for quotes; the contracts go to mainnet only after an independent review.
+  OpenZeppelin and CertiK for audit quotes; the contracts go to mainnet only after an independent review.
 
 **What a handoff keeps, and what it leaves out**
 
@@ -568,7 +567,7 @@ you included. `mida export <folder>` writes a readable copy first.
 | npm packages: [`mida-context`](https://www.npmjs.com/package/mida-context), [`@mida-context/sdk`](https://www.npmjs.com/package/@mida-context/sdk) | ✅ Published, Sep 29 |
 | A paid job for another team: Kanmani's escrow on Monad mainnet paid a Mida agent 0.50 USDC to recheck 10 payment claims ([the claims](https://kanmani.xyz/claims)). The brief and the findings were Mida records written by that agent, and the delivery pointed at the findings record. Kanmani could check the record on chain but could not read it, because sharing with another team's app isn't shipped yet | ✅ Oct 5 ([evidence](docs/evidence/kanmani-job-2026-10-05.md)) |
 | An agent that another team's registry controls: before it pays, a Mida agent checks the `DelegationRegistry` of [TrustLayer](https://github.com/Valorian0108/Trustlayer), another Monad Metropolis team, on Monad testnet. It reads the owner's brief through Mida and writes its receipt as a Mida record. In the live run it paid 0.01 MON once, refused the same brief again, and refused after each revoke: TrustLayer's, then Mida's. TrustLayer merged it into their repository on Oct 6 ([PR #2](https://github.com/Valorian0108/Trustlayer/pull/2)) | ✅ Oct 6 ([evidence](docs/evidence/trustlayer-integration-2026-10-06.md)) |
-| Security audit | ❌ None |
+| Security audit | ❌ None yet. On Oct 6, 2026 we asked OpenZeppelin and CertiK for audit quotes. No review has started |
 
 3,998 automated tests pass on this release: `pnpm test`.
 
