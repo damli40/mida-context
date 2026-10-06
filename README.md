@@ -569,6 +569,22 @@ you included. `mida export <folder>` writes a readable copy first.
 | An agent that another team's registry controls: before it pays, a Mida agent checks the `DelegationRegistry` of [TrustLayer](https://github.com/Valorian0108/Trustlayer), another Monad Metropolis team, on Monad testnet. It reads the owner's brief through Mida and writes its receipt as a Mida record. In the live run it paid 0.01 MON once, refused the same brief again, and refused after each revoke: TrustLayer's, then Mida's. TrustLayer merged it into their repository on Oct 6 ([PR #2](https://github.com/Valorian0108/Trustlayer/pull/2)) | ✅ Oct 6 ([evidence](docs/evidence/trustlayer-integration-2026-10-06.md)) |
 | Security audit | ❌ None yet. On Oct 6, 2026 we asked OpenZeppelin and CertiK for audit quotes. No review has started |
 
+### Work with other teams, drawn out
+
+Each outside team that Mida works with gets one diagram. Each evidence file lists every transaction.
+
+**TrustLayer: an agent that two permissions control.** TrustLayer decides what the agent may do. Mida decides what it
+may know, and records what it did. The owner can revoke either one. TrustLayer merged the agent into their repository
+on Oct 6 ([evidence](docs/evidence/trustlayer-integration-2026-10-06.md)).
+
+<img alt="How Mida and TrustLayer work together. The owner delegates the agent in TrustLayer's registry, with a spending level, and approves it in Mida and writes a brief. On each run the Mida agent: 1, asks TrustLayer if it may act for this owner, and stops if not; 2, asks Mida for the owner's newest brief, and counts it only if the chain says the owner wrote it; 3, checks that the amount fits the level's limit; 4, pays the recipient on Monad testnet; 5, writes a receipt into Mida, signed by the agent. Two red revoke switches belong to the owner: revoke in TrustLayer and the agent may no longer do anything; revoke in Mida and it may no longer know anything. The agent runs both checks itself; nothing on chain forces them. Monad testnet, not audited." src="docs/architecture/mida-trustlayer.png" width="100%">
+
+**Kanmani: a paid job, done through Mida.** Kanmani's escrow on Monad mainnet paid a Mida agent 0.50 USDC to recheck
+10 payment claims. The brief and the findings were Mida records on Monad testnet. Kanmani could check that the record
+exists on chain, but it could not read the record ([evidence](docs/evidence/kanmani-job-2026-10-05.md)).
+
+<img alt="Another team paid for work done through Mida. 1, the Mida agent writes the job's brief as an encrypted Mida record on Monad testnet; 2, Kanmani funds the job in its escrow on Monad mainnet, 0.50 USDC, with terms that point at the brief record; 3, the agent does the work and writes its findings as a second Mida record; 4, the agent delivers, pointing at the findings record; 5, Kanmani checks that the record exists on chain and settles 0.50 USDC to the agent; 6, the owner revokes the agent, which stops its future reads. Honest limit: Kanmani could check the record on chain but not read it, because sharing with another team's app is not shipped yet; Kanmani received the findings as a file. Not audited." src="docs/architecture/mida-kanmani.png" width="100%">
+
 3,998 automated tests pass on this release: `pnpm test`.
 
 ---
