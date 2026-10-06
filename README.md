@@ -14,10 +14,11 @@
 </p>
 
 <p align="center">
-  <b>Your context, in a store you own.</b> Tell one AI, and every AI you approve can read it. Mida
-  keeps what you tell it about yourself and what your agents learn about your work, encrypted under
-  keys you hold. The first thing it proves is the hardest: one coding agent finishes the job another
-  one started, with your decisions, preferences, last-minute changes and style rules carried over.
+  <b>Switch AI coding agents without starting over.</b> Mida Context is a user-owned context layer
+  for AI agents: encrypted under your keys, read only by agents you approve and can revoke on Monad.
+  It keeps what you tell it about yourself and what your agents learn about your work. The first thing
+  it proves is the hardest: one coding agent finishes the job another one started, with your
+  decisions, preferences, last-minute changes and style rules carried over.
 </p>
 
 <p align="center">
@@ -615,11 +616,12 @@ test build. We have not measured it on a running service over days.
 on a new account with a handful of saves. All of these measurements come from one owner on one
 machine.
 
-**We designed the fix. It is not in this release.** Each agent will keep a memory index: a signed,
+**We designed the fix. It is not in this release, and it is parked until after the hackathon.** Each agent will keep a memory index: a signed,
 encrypted table of contents of its saved sessions. In the common case a session start will read the
 index, check a handful of entries on Monad, and open the one checkpoint it needs. Checkpoints stay
-the source of truth, and the chain decides which copy is newest. We built and tested the store side
-on a development branch. We have not built the client side.
+the source of truth, and the chain decides which copy is newest. We built the store side and the
+write side on a development branch; three adversarial reviews kept finding problems in the write
+side, so we chose not to rush it. The reading side is not built.
 
 ---
 
@@ -632,7 +634,7 @@ much harder to take with you. Mida keeps that context yours wherever the model r
 hosted store, because you hold the keys and you approve every reader. Today that works for agents that connect
 through Mida's hooks and MCP tools. Reaching cloud agents like these is part of the plan.
 
-None of the following is built yet:
+None of the following has shipped yet:
 
 - **Cloud agents.** A remote Mida endpoint over MCP, with sign-in, for agents and chat apps that cannot run a
   program on your machine.
