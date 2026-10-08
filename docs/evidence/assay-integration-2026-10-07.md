@@ -15,8 +15,8 @@ and after the owner revoked the second agent its next read was refused while the
 
 **What it shows, and what it does not.** It shows two independent proofs about one answer on Monad: ASSAY's for
 which host and model produced it, Mida's for which agent saved it, for which owner, and which agents may read it.
-It shows the revoke stopping the reader on its own. It does NOT show ASSAY's team running our program or reviewing it (our half is a draft
-pull request on their repository, opened Oct 7, not yet reviewed or merged), a receipt proving which model weights ran (a
+It shows the revoke stopping the reader on its own. It does NOT show ASSAY's team running our program or reviewing it (they merged our half on Oct 8 with no
+written review on the pull request), a receipt proving which model weights ran (a
 receipt proves which host served which bytes and what the host claimed), or anything on mainnet. ASSAY's team
 cannot read the Mida record: on chain they can see that a record exists, who wrote it and when, plus a hash of
 its encrypted content. Anyone can register as an ASSAY host, so the reader trusts only the hosts named in its own
@@ -73,7 +73,9 @@ with the chain read on (a fake chain answering yes or no).
 **Noted about ASSAY's checker:** `check.mts --offline` (and `checkRecord` with `offline: true`) skips the chain
 read, so on its own it is not acceptance: a record signed with a made-up key that names a trusted host passes it.
 It is meant for CI on a known fixture. We told ASSAY's builder on Oct 7. Our program never uses it, and our README
-there says not to treat an offline pass as acceptance.
+there says not to treat an offline pass as acceptance. **Fixed upstream Oct 8** (ASSAY main `556d415`, `c7a1334`):
+offline now accepts only a signing key the reader pinned by its RFC 7638 thumbprint, refuses when no key is pinned,
+and prints that the chain was not checked. ASSAY's README credits Mida for the finding.
 
 **Known and left as is:** the pinned `@mida-context/sdk` 0.1.4 was published Oct 4 (three days old, under the
 house seven-day rule; it is Mida's own package). The program does not ask the RPC which chain it is; the receipt's
@@ -83,8 +85,9 @@ fingerprint covers the host id, which names the chain, and the reviewer found no
 
 - Code: branch `mida-integration` at `4bd356b` on `github.com/damli40/Assay` (Dami's fork), opened Oct 7 as a draft
   pull request on ASSAY's repository: https://github.com/trudransh/Assay/pull/6. 26 commits on top of ASSAY's main,
-  29 files, all under `examples/mida-context/` (four lines appended to their README there). Not yet reviewed or
-  merged by ASSAY.
+  29 files, all under `examples/mida-context/` (four lines appended to their README there). Rebased on their main
+  Oct 8 at their request (head `018927c`, 25 commits; 158/158 of our tests and 8/8 of their record tests passed),
+  then **merged by ASSAY on Oct 8 at 05:02 UTC** (merge commit `b3650cf`). No written review on the pull request.
 - Private files, never committed: `runs/`, `exports/`, `.env`, `.mida/` in that folder (all gitignored; the first
   two hold the salt of the test receipt).
 - Diagram: `docs/architecture/mida-assay.{excalidraw,svg,png}`.
