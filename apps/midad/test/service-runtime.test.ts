@@ -249,6 +249,33 @@ describe("ServiceRuntime — the daemon's runtime", () => {
     )
     expect(home.readJson<{ pid?: number }>("midad.lock")?.pid).toBe(process.pid)
   })
+
+  it("keeps one block-time map for its life, saves the first change at once, then at most every 30 s, and on close (CHAIN-04 MIN-2)", async () => {
+    const home = freshHome()
+    home.writeSecretJson("owner-address.json", { address: OWNER })
+    home.writeSecretJson("state/block-times.json", { chainId: "31337", blocks: { "5": "100" } })
+    const runtime = await ServiceRuntime.open(home, network)
+    const savedBlocks = () => (JSON.parse(readFileSync(home.path("state/block-times.json"), "utf8")) as { blocks: Record<string, string> }).blocks
+    try {
+      expect(runtime.blockTimes().get(5n)).toBe(100n)
+      expect(runtime.readScope().blockTimes()).toBe(runtime.blockTimes())
+      expect(runtime.saveBlockTimesIfGrown(Date.now())).toBe(false) // nothing changed since loading
+      runtime.blockTimes().set(6n, 106n)
+      expect(runtime.saveBlockTimesIfGrown(Date.now())).toBe(true) // the first change is saved at once
+      expect(savedBlocks()).toEqual({ "5": "100", "6": "106" })
+      runtime.blockTimes().set(7n, 107n)
+      expect(runtime.saveBlockTimesIfGrown(Date.now())).toBe(false) // inside 30 s of the last write
+      // a full map evicts and adds: same size, still a change
+      runtime.blockTimes().delete(5n)
+      runtime.blockTimes().set(8n, 108n)
+      expect(runtime.saveBlockTimesIfGrown(Date.now() + 31_000)).toBe(true)
+      expect(savedBlocks()).toEqual({ "6": "106", "7": "107", "8": "108" })
+      runtime.blockTimes().set(9n, 109n)
+    } finally {
+      await runtime.close() // close saves the change the throttle held back
+    }
+    expect(savedBlocks()).toMatchObject({ "9": "109" })
+  })
 })
 
 describe("Windows process probe", () => {

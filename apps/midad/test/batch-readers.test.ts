@@ -1391,3 +1391,151 @@ describe("migrate — the batched-saves guard fails closed", () => {
     }
   })
 })
+
+describe("readCheckpoints — CHAIN-04 (Oct 5): both lanes at once, and only this folder's pending saves are waited for", () => {
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+  /** A pending row like pendingItem, but saved for `projectId`. */
+  const pendingIn = (projectId: string, contextId: Hex, eventId: string, authorAgentId: Hex) => ({
+    ...pendingItem(contextId, eventId, authorAgentId),
+    payload: {
+      v: 1,
+      value: wrapCheckpoint({ projectId, sessionId: "s1", continuesSession: null, compiledBy: "test", checkpoint: sampleCheckpoint({ eventId, objective: `objective-${eventId}` }) }),
+      kind: "EPISODE",
+      provenance: { source: "AGENT_INFERRED" },
+    },
+  })
+
+  it("the batched lane starts while the direct lane is still reading", async () => {
+    const store = await stubStore()
+    try {
+      const home = batchedHome(store.url)
+      const starts: { direct?: number; batched?: number } = {}
+      const agent = {
+        readWithStatus: async () => {
+          starts.direct = Date.now()
+          await sleep(300)
+          return { objects: [], partial: false }
+        },
+        readBatchedWithStatus: async () => {
+          starts.batched = Date.now()
+          await sleep(300)
+          return emptyBatched
+        },
+      }
+      const runtime = fakeRuntime(home, { network: batchedNetwork(store.url), apiBaseUrl: store.url, agent })
+      const began = Date.now()
+      await readCheckpoints(runtime, "claude-code", "p-1")
+      expect(starts.batched! - starts.direct!).toBeLessThan(200)
+      expect(Date.now() - began).toBeLessThan(550) // was 300 + 300 in a row
+    } finally {
+      await store.close()
+    }
+  })
+
+  it("a direct-lane failure rejects the read once and leaves no unhandled rejection", async () => {
+    const store = await stubStore()
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown) => unhandled.push(reason)
+    process.on("unhandledRejection", onUnhandled)
+    try {
+      const home = batchedHome(store.url)
+      const agent = {
+        readWithStatus: async () => {
+          throw new Error("store down")
+        },
+        readBatchedWithStatus: async () => {
+          await sleep(150)
+          throw new Error("batch table down too")
+        },
+      }
+      const runtime = fakeRuntime(home, { network: batchedNetwork(store.url), apiBaseUrl: store.url, agent })
+      await expect(readCheckpoints(runtime, "claude-code", "p-1")).rejects.toThrow("store down")
+      await sleep(250)
+      expect(unhandled).toEqual([])
+    } finally {
+      process.off("unhandledRejection", onUnhandled)
+      await store.close()
+    }
+  })
+
+  it("another folder's pending save by another agent causes no flush and no wait", async () => {
+    const store = await stubStore()
+    try {
+      const home = batchedHome(store.url)
+      const agent = {
+        readWithStatus: async () => ({ objects: [], partial: false }),
+        readBatchedWithStatus: async () => ({ ...emptyBatched, pending: [pendingIn("p-2", `0x${"e1".repeat(32)}` as Hex, "cp-elsewhere", OTHER_AGENT_ID)] }),
+      }
+      const runtime = fakeRuntime(home, { network: batchedNetwork(store.url), apiBaseUrl: store.url, agent })
+      const began = Date.now()
+      const result = await readCheckpoints(runtime, "claude-code", "p-1", { flushWaitMs: 2_000 })
+      expect(store.flushes).toBe(0)
+      expect(Date.now() - began).toBeLessThan(1_000)
+      expect(result.checkpoints).toHaveLength(0)
+    } finally {
+      await store.close()
+    }
+  })
+
+  it("this folder's pending save by another agent still flushes once and waits (the demo's moment)", async () => {
+    const store = await stubStore()
+    try {
+      const home = batchedHome(store.url)
+      const contextId = `0x${"e2".repeat(32)}` as Hex
+      const agent = {
+        readWithStatus: async () => ({ objects: [], partial: false }),
+        readBatchedWithStatus: async () => ({ ...emptyBatched, pending: [pendingIn("p-1", contextId, "cp-here-1", OTHER_AGENT_ID)] }),
+      }
+      const runtime = fakeRuntime(home, { network: batchedNetwork(store.url), apiBaseUrl: store.url, agent })
+      const began = Date.now()
+      const result = await readCheckpoints(runtime, "claude-code", "p-1", { flushWaitMs: 300 })
+      expect(store.flushes).toBe(1)
+      expect(Date.now() - began).toBeGreaterThanOrEqual(250) // it waited for the save to anchor
+      expect(result.checkpoints).toHaveLength(1)
+      expect(result.checkpoints[0]).toMatchObject({ contextId, anchor: "PENDING_ANCHOR" })
+    } finally {
+      await store.close()
+    }
+  })
+
+  it("a pending row whose payload is not a checkpoint is not waited for", async () => {
+    const store = await stubStore()
+    try {
+      const home = batchedHome(store.url)
+      const notACheckpoint = { ...pendingItem(`0x${"e3".repeat(32)}` as Hex, "cp-junk-1", OTHER_AGENT_ID), payload: { v: 1, value: { not: "a checkpoint" } } }
+      const agent = {
+        readWithStatus: async () => ({ objects: [], partial: false }),
+        readBatchedWithStatus: async () => ({ ...emptyBatched, pending: [notACheckpoint] }),
+      }
+      const runtime = fakeRuntime(home, { network: batchedNetwork(store.url), apiBaseUrl: store.url, agent })
+      const result = await readCheckpoints(runtime, "claude-code", "p-1", { flushWaitMs: 2_000 })
+      expect(store.flushes).toBe(0)
+      expect(result.skipped).toBe(1)
+    } finally {
+      await store.close()
+    }
+  })
+
+  it("the flush wait ends before a caller's deadline, keeping the pending row marked (IMP-1)", async () => {
+    const store = await stubStore()
+    try {
+      const home = batchedHome(store.url)
+      const contextId = `0x${"e4".repeat(32)}` as Hex
+      const agent = {
+        readWithStatus: async () => ({ objects: [], partial: false }),
+        readBatchedWithStatus: async () => {
+          await sleep(400) // each read of the batch table takes 400 ms
+          return { ...emptyBatched, pending: [pendingIn("p-1", contextId, "cp-deadline-1", OTHER_AGENT_ID)] }
+        },
+      }
+      const runtime = fakeRuntime(home, { network: batchedNetwork(store.url), apiBaseUrl: store.url, agent })
+      const began = Date.now()
+      const result = await readCheckpoints(runtime, "claude-code", "p-1", { flushWaitMs: 3_000, deadlineAt: began + 1_200 })
+      expect(Date.now() - began).toBeLessThan(1_300) // never a re-read that ends past the deadline
+      expect(result.checkpoints).toHaveLength(1)
+      expect(result.checkpoints[0]).toMatchObject({ contextId, anchor: "PENDING_ANCHOR" })
+    } finally {
+      await store.close()
+    }
+  })
+})

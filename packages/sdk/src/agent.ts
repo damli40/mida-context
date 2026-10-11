@@ -217,6 +217,11 @@ export interface MidaAgentConfig {
   encryptionPrivateKey: Uint8Array
   /** Optional shared epoch-key cache (CHAIN-04); without one, this agent keeps its own. */
   epochKeyCache?: EpochKeyCache
+  /**
+   * Optional long-lived block-timestamp map (CHAIN-04, Oct 5); without one, each batched read asks
+   * the chain about every anchoring block again. Block times never change, so sharing is safe.
+   */
+  blockTimeCache?: Map<bigint, bigint>
   /** Write context whose account is the agent's current registered signer. */
   chain: LocalWriteContext
   /** Context API client bound to the same signer. */
@@ -261,6 +266,7 @@ export class MidaAgent {
   readonly #requests: AccessRequestStore
   readonly #reader: RegistryReader
   readonly #epochKeys: EpochKeyCache
+  readonly #blockTimes: Map<bigint, bigint> | undefined
   readonly #grants: Grant[] = []
 
   constructor(config: MidaAgentConfig) {
@@ -275,6 +281,7 @@ export class MidaAgent {
     this.#requests = config.requests ?? new MemoryAccessRequestStore()
     this.#reader = new RegistryReader(config.chain)
     this.#epochKeys = config.epochKeyCache ?? new Map()
+    this.#blockTimes = config.blockTimeCache
     for (const grant of config.grants ?? []) {
       if (grant.agentId.toLowerCase() !== this.agentId) {
         throw new MidaError("AUTH_INVALID", "a restored grant belongs to a different agent")
@@ -554,7 +561,7 @@ export class MidaAgent {
     })
     // The anchor transaction's block time is Monad's stamp for every save in that batch — one
     // block lookup per distinct batch, shared across the rows it anchored.
-    const blockTime = blockTimeCache(this.#chain.publicClient)
+    const blockTime = blockTimeCache(this.#chain.publicClient, this.#blockTimes)
     // Each row's verify+decrypt is independent — run them under the same bounded worker pool a
     // direct read uses (in-9 R-5), then partition the indexed results in list order so anchored,
     // pending and skipped keep exactly the order the serial loop produced.

@@ -3,7 +3,7 @@ import { entryPoint08Address } from "viem/account-abstraction"
 import type { AbiEvent } from "viem"
 import { MidaError, NAMESPACE_TREE_VERSION, PERMISSION, POLICY_VERSION, accessRequestHash, decodeUint64, displaySafeLine, encodeUint64, isMidaError, namespaceById, namespaceId } from "@mida/protocol"
 import type { AccessGrantResponse, AccessRequest, Address, GrantAdvice, GrantedCapability, Hex, PurposeId, RequestedScope } from "@mida/protocol"
-import { batchAnchorAbi, capabilityRegistryAbi, createSponsoredSender, createWriteContext, failedBeforeSend, getLogsChunked, latestTimestamp, ownerHistory, readAgentRecord, recordPlacementsNear } from "@mida/chain"
+import { capabilityRegistryAbi, createSponsoredSender, createWriteContext, failedBeforeSend, getLogsChunked, latestTimestamp, ownerHistory, readAgentRecord, recordPlacementsNear } from "@mida/chain"
 import type { ChainContext, DecodedLog, HistoryScanCursor, RecordPlacement } from "@mida/chain"
 import { DENY_CANCEL_EXPIRY_SECONDS, provisionAgent } from "@mida/fake-vault"
 import { POLICY_DOCUMENT_V1, adviseGrant, assertRequestFresh, expandScopeInputs, permissionBits, provenancePolicyBits } from "@mida/grant-advisor"
@@ -12,7 +12,7 @@ import type { BatchReceipt, RegistryReader } from "@mida/api"
 import { compareChainOrder } from "@mida/checkpoint"
 import type { StoredCheckpoint as CheckpointRecord } from "@mida/checkpoint"
 import type { ContextObject, Grant } from "@mida/sdk"
-import { FLUSH_WAIT_MS, RESUBMIT_LANE_CLOSED, addPendingAnchor, batchStatusProbe, flushForeignPending, keepPendingPlaintext, laneForSave } from "./batching.js"
+import { FLUSH_WAIT_MS, RESUBMIT_LANE_CLOSED, addPendingAnchor, keepPendingPlaintext, laneForSave, readBatchedLane } from "./batching.js"
 import type { Lane } from "./batching.js"
 import { readSavedIds, recordSavedId } from "./saved-ids.js"
 import { NAMESPACE, PURPOSE_ID, makeOwnerBalanceGuard, parseSponsorUrl, sponsorReachable } from "./runtime.js"
@@ -1459,14 +1459,40 @@ export async function readCheckpoints(
   runtime: ServiceRuntime,
   name: string,
   projectId: string,
-  options?: { flushWaitMs?: number },
+  options?: { flushWaitMs?: number; deadlineAt?: number },
 ): Promise<{ checkpoints: StoredCheckpoint[]; skipped: number; milliseconds: number; partial: boolean }> {
   if (typeof projectId !== "string" || projectId === "") throw codedError("bad-input", "projectId must be a non-empty string")
   const started = Date.now()
   const agent = runtime.agent(name)
-  // readWithStatus, not read: a partial list still yields its checkpoints — the caller flags them
-  // rather than the read throwing away work that did verify (M3-D).
-  const { objects, partial: directPartial } = await agent.readWithStatus(runtime.owner, NAMESPACE)
+  const deployment = runtime.network?.deployment
+  const batchAnchor = deployment?.batchAnchor
+  // CHAIN-04 (Oct 5): the two lanes ask different stores and chain questions and neither needs the
+  // other's answer, so they run at the same time — measured on the demo home they took 4.5 s and
+  // 5.3 s in a row. Promise.all handles both rejections, so a failing lane leaves nothing unhandled.
+  const [{ objects, partial: directPartial }, batchedLane] = await Promise.all([
+    // readWithStatus, not read: a partial list still yields its checkpoints — the caller flags them
+    // rather than the read throwing away work that did verify (M3-D).
+    agent.readWithStatus(runtime.owner, NAMESPACE),
+    batchAnchor !== undefined && deployment !== undefined
+      ? readBatchedLane({
+          runtime,
+          agentName: name,
+          deployment,
+          batchAnchor,
+          readBatched: async () => {
+            try {
+              return await agent.readBatchedWithStatus(runtime.owner, NAMESPACE)
+            } catch {
+              return null
+            }
+          },
+          flushWaitMs: options?.flushWaitMs ?? FLUSH_WAIT_MS,
+          ...(options?.deadlineAt === undefined ? {} : { deadlineAt: options.deadlineAt }),
+          // only a pending save of THIS project can change this handoff, so only one is worth the wait
+          counts: (item) => unwrapCheckpoint((item as ContextObject).payload.value)?.projectId === projectId,
+        })
+      : Promise.resolve(undefined),
+  ])
   let partial = directPartial
   let skipped = 0
   const checkpoints: StoredCheckpoint[] = []
@@ -1498,66 +1524,16 @@ export async function readCheckpoints(
   }
   for (const object of objects) collect(object, "ANCHORED")
 
-  const deployment = runtime.network?.deployment
-  const batchAnchor = deployment?.batchAnchor
   let mergedBatched = false
-  if (batchAnchor !== undefined && deployment !== undefined) {
-    // The batch table exists only where the store serves it for THIS anchor: the status probe is
-    // what decideLane itself asks. But a store that answers nothing — a local store, a pre-batch
-    // host — or one answering for another anchor says nothing about what the CHAIN holds: its
-    // silence is not proof of an empty table. Only the contract's own hasBatchedSaves flag can
-    // say "nothing to miss" — it is set the moment the owner has an accepted batched save and no
-    // store outage clears it. A "true", or a read that fails, marks the answer partial rather
-    // than letting a route-less store hide batched saves.
-    const status = await batchStatusProbe(runtime.apiBaseUrl)
-    // the anchor is absent on a degraded lane's answer — only a string it echoed can match
-    if (status !== null && typeof status.batchAnchor === "string" && status.batchAnchor.toLowerCase() === batchAnchor.toLowerCase()) {
-      const readBatched = async () => {
-        try {
-          return await agent.readBatchedWithStatus(runtime.owner, NAMESPACE)
-        } catch {
-          return null
-        }
-      }
-      let batched = await readBatched()
-      if (batched === null) {
-        // The batch table did not answer though the surface is there — the merged list is
-        // incomplete, so partial it is; nothing here may pretend the batch side was empty.
-        partial = true
-      } else {
-        // Agent switch (Amendment B.4): ask the store to anchor the queue now — once per read,
-        // and only while the lane is open (in-21 U-3: a closed lane anchors nothing, so the
-        // pending rows render marked without a flush call or a wait).
-        batched = await flushForeignPending({
-          runtime,
-          agentName: name,
-          deployment,
-          enabled: status.enabled,
-          batched,
-          readBatched,
-          flushWaitMs: options?.flushWaitMs ?? FLUSH_WAIT_MS,
-        })
-        skipped += batched.skipped.length
-        if (batched.partial) partial = true
-        const directCount = checkpoints.length
-        for (const object of batched.anchored) collect(object, "ANCHORED")
-        for (const item of batched.pending) collect(item, "PENDING_ANCHOR")
-        mergedBatched = checkpoints.length > directCount
-      }
-    } else {
-      // No batch surface for this anchor on this store — ask the chain whether there is a table
-      // to miss at all. Fail closed: a thrown read is "unknown", and unknown is never "none".
-      try {
-        const has = (await runtime.chain.publicClient.readContract({
-          address: batchAnchor,
-          abi: batchAnchorAbi,
-          functionName: "hasBatchedSaves",
-          args: [runtime.owner],
-        } as never)) as boolean
-        if (has) partial = true
-      } catch {
-        partial = true
-      }
+  if (batchedLane !== undefined) {
+    if (batchedLane.partial) partial = true
+    const batched = batchedLane.batched
+    if (batched !== undefined) {
+      skipped += batched.skipped.length
+      const directCount = checkpoints.length
+      for (const object of batched.anchored) collect(object, "ANCHORED")
+      for (const item of batched.pending) collect(item, "PENDING_ANCHOR")
+      mergedBatched = checkpoints.length > directCount
     }
   }
   // A same-second tie that spans the two lanes needs every member's chain placement before

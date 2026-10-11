@@ -421,6 +421,8 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
         agent: isSafeName(agent) ? agent : null,
         kind: result.kind,
         reason: result.kind === "refused" ? result.reason : null,
+        // CHAIN-13: the code behind a read-failed refusal — a code or class name, never a message
+        readError: result.kind === "refused" && result.errorCode !== undefined ? result.errorCode : null,
         checkpoints: result.kind === "handoff" ? result.checkpoints : 0,
         facts: result.kind === "refused" ? 0 : result.facts,
         factsFailed: result.kind === "refused" ? null : result.factsFailed,
@@ -436,6 +438,8 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
         ms: deps.now() - started,
       })
       reply(res, 200, result)
+      // CHAIN-04: block times learned by this read survive a restart (at most one write per 30 s)
+      runtime.saveBlockTimesIfGrown?.()
       return
     }
     if (req.url === "/whatsnew") {
@@ -466,6 +470,8 @@ export async function startDaemon(deps: DaemonDeps): Promise<DaemonHandle> {
         ms: deps.now() - started,
       })
       reply(res, 200, result)
+      // CHAIN-04: block times learned by this read survive a restart (at most one write per 30 s)
+      runtime.saveBlockTimesIfGrown?.()
       return
     }
     // mida-mcp's one write: the model's checkpoint fields through the same gates and save path the

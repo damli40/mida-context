@@ -54,13 +54,19 @@ export type HandoffResult =
       partial: boolean
     }
   | { kind: "empty"; text: string; facts: number; factsFailed: string | null; readMs: number; seen: string[]; partial: boolean }
-  | { kind: "refused"; text: string; reason: string }
+  | {
+      kind: "refused"
+      text: string
+      reason: string
+      /** CHAIN-13: the thrown read error's code or class name, for the service's log only — never shown to the agent. */
+      errorCode?: string
+    }
 
 /** What the chain says about the agent's grants: one is live, at least one was revoked, or nothing valid remains. */
 export type CapabilityState = "live" | "none" | "revoked"
 
 export interface HandoffDeps {
-  /** The read must finish inside this budget so the daemon answers before the hook's 8 s client timeout. Default 7.5 s. */
+  /** The whole handoff must finish inside this budget, so the daemon answers before the hook's 8 s client timeout. Default 7 s. */
   limitMs?: number
   checkProject?: (runtime: ServiceRuntime, input: { agent: string; cwd: string }) => Promise<ProjectCheck>
   capability?: (runtime: ServiceRuntime, agent: string) => Promise<CapabilityState>
@@ -77,7 +83,14 @@ export interface HandoffDeps {
   now?: () => number
 }
 
-const HANDOFF_READ_LIMIT_MS = 7_500
+/**
+ * The whole handoff's budget, from the request to the answer (CHAIN-04, Oct 5). The session-start
+ * hook waits 8 s for the service (inject-main.ts HANDOFF_TIMEOUT_MS); the service must answer
+ * first, or the agent is told "daemon-slow" instead of Mida's own "may be incomplete".
+ */
+const HANDOFF_READ_LIMIT_MS = 7_000
+/** IMP-1: what the read leaves of the budget for rendering and the reply. */
+const HANDOFF_RENDER_RESERVE_MS = 750
 
 const notApprovedText = (agent: string): string =>
   `Mida: ${agent} is not approved for this project — run \`mida approve ${agent}\` in this folder.`
@@ -336,7 +349,27 @@ export function noContextText(code: string): string {
   return `Mida: no context available right now (${code}).`
 }
 
-const refused = (reason: string, text: string): HandoffResult => ({ kind: "refused", reason, text })
+const refused = (reason: string, text: string, errorCode?: string): HandoffResult => ({
+  kind: "refused",
+  reason,
+  text,
+  ...(errorCode === undefined ? {} : { errorCode }),
+})
+
+/**
+ * CHAIN-13: what a thrown read error is, for the service's log only — a Mida-shaped code
+ * (UPPER_SNAKE), else the error's class name, plus a network cause's code (e.g. ECONNREFUSED).
+ * Never a message, and never a free-form code a store chose (MIN-4), which can carry ids.
+ */
+function errorCodeOf(error: unknown): string {
+  const CODE = /^[A-Z][A-Z0-9_]{1,47}$/
+  const NAME = /^[A-Za-z][A-Za-z0-9]{0,47}$/
+  const e = error as { code?: unknown; name?: unknown; cause?: { code?: unknown } } | null
+  const base =
+    typeof e?.code === "string" && CODE.test(e.code) ? e.code : typeof e?.name === "string" && NAME.test(e.name) ? e.name : "unknown"
+  const cause = e?.cause?.code
+  return typeof cause === "string" && CODE.test(cause) ? `${base}:${cause}` : base
+}
 
 /**
  * The refusal a failed project check carries — one mapping shared by checkAccess and the CLI's
@@ -684,7 +717,10 @@ export async function buildHandoff(
 ): Promise<HandoffResult> {
   const agent = input.agent
   try {
+    const now = deps.now ?? (() => Date.now())
     const limitMs = deps.limitMs ?? HANDOFF_READ_LIMIT_MS
+    // CHAIN-04 (Oct 5): one budget from here — the access check's time comes out of the read's
+    const operationStarted = now()
     // in-9 R-5: one read memo and one deadline for the whole operation — the capability gate,
     // the checkpoint read and the fact read share it, so each distinct chain question costs
     // one wire request and nothing new starts once the budget is spent. A test double built
@@ -723,7 +759,6 @@ export async function buildHandoff(
 
     // Mida's own undelivered saves are newer work this record cannot know — one read-only count,
     // after access is granted and scoped to this project. Never a queue control.
-    const now = deps.now ?? (() => Date.now())
     // CAP-26 (Fable review): the queue as it was BEFORE the read — a save that lands while the read
     // runs is missing from what the read returns AND from the queue after it; this snapshot keeps
     // the note's "this record may be behind it" for exactly that fast-switch moment
@@ -731,7 +766,9 @@ export async function buildHandoff(
     const readStarted = now()
     // `settled` never rejects, so a read that finishes or fails after the deadline is discarded
     // quietly — no unhandled rejection, and its text is never logged or rendered.
-    const settled = (deps.read ?? readCheckpoints)(scoped, agent, check.projectId).then(
+    const settled = (deps.read ?? readCheckpoints)(scoped, agent, check.projectId, {
+      deadlineAt: operationStarted + limitMs - HANDOFF_RENDER_RESERVE_MS,
+    }).then(
       (value): ReadOutcome => ({ status: "ok", checkpoints: value.checkpoints, partial: value.partial }),
       (error): ReadOutcome => ({ status: "failed", error }),
     )
@@ -743,7 +780,7 @@ export async function buildHandoff(
     )
     let timer: ReturnType<typeof setTimeout> | undefined
     const slow = new Promise<ReadOutcome | FactOutcome>((resolve) => {
-      timer = setTimeout(() => resolve({ status: "slow" }), limitMs)
+      timer = setTimeout(() => resolve({ status: "slow" }), Math.max(0, limitMs - (now() - operationStarted)))
     })
     // The two reads are independent and run concurrently (R4-2): each is raced against the one
     // shared deadline, so the facts read gets the checkpoint read's leftover time, not a fresh
@@ -768,7 +805,7 @@ export async function buildHandoff(
       // misconfigured or refused-key RPC), never "not approved" (in-11 R-8)
       const chainReason = chainRefusalReason(error)
       if (chainReason !== undefined) return refused(chainReason, CHAIN_REFUSAL_TEXT[chainReason])
-      return refused("read-failed", noContextText("read-failed"))
+      return refused("read-failed", noContextText("read-failed"), errorCodeOf(error))
     }
     const facts = factOutcome.status === "ok" ? factOutcome.facts : []
     const factsFailed = factOutcome.status === "ok" ? null : factOutcome.status === "slow" ? "facts-read-slow" : "facts-read-failed"
