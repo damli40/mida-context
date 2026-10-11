@@ -3,12 +3,12 @@ import { isAbsolute } from "node:path"
 import { zeroHash } from "viem"
 import { canonicalizeNamespace, isMidaError, namespaceId } from "@mida/protocol"
 import type { ContextKind, Hex, RecordReference } from "@mida/protocol"
-import { batchAnchorAbi, recordPlacementsNear } from "@mida/chain"
+import { recordPlacementsNear } from "@mida/chain"
 import type { RecordPlacement } from "@mida/chain"
 import { compareChainOrder, orderTime, otherTasksFor, taskOf } from "@mida/checkpoint"
 import type { MigrationEnvelope, StoredCheckpoint } from "@mida/checkpoint"
 import type { ContextObject } from "@mida/sdk"
-import { FLUSH_WAIT_MS, batchStatusProbe, flushForeignPending } from "./batching.js"
+import { FLUSH_WAIT_MS, readBatchedLane } from "./batching.js"
 import { chainRefusalReason } from "./chain-busy.js"
 import { unwrapCheckpoint } from "./checkpoint-payload.js"
 import type { CheckpointEnvelope } from "./checkpoint-payload.js"
@@ -134,56 +134,41 @@ async function readNamespaceObjects(
   options?: { flushWaitMs?: number },
 ): Promise<NamespaceRead> {
   const agent = runtime.agent(name)
-  const { objects, partial: directPartial } = await agent.readWithStatus(runtime.owner, namespace)
-  let partial = directPartial
-  let skipped = 0
-  const merged: ReadObject[] = [...objects]
   const deployment = runtime.network?.deployment
   const batchAnchor = deployment?.batchAnchor
-  let mergedBatched = false
-  if (batchAnchor !== undefined && deployment !== undefined) {
-    const status = await batchStatusProbe(runtime.apiBaseUrl)
-    // the anchor is absent on a degraded lane's answer — only a string it echoed can match
-    if (status !== null && typeof status.batchAnchor === "string" && status.batchAnchor.toLowerCase() === batchAnchor.toLowerCase()) {
-      const readBatched = async () => {
-        try {
-          return await agent.readBatchedWithStatus(runtime.owner, namespace)
-        } catch {
-          return null
-        }
-      }
-      let batched = await readBatched()
-      if (batched === null) {
-        partial = true
-      } else {
-        batched = await flushForeignPending({
+  // CHAIN-04 (Oct 5): both lanes at once — see readCheckpoints
+  const [{ objects, partial: directPartial }, batchedLane] = await Promise.all([
+    agent.readWithStatus(runtime.owner, namespace),
+    batchAnchor !== undefined && deployment !== undefined
+      ? readBatchedLane({
           runtime,
           agentName: name,
           deployment,
-          enabled: status.enabled,
-          batched,
-          readBatched,
+          batchAnchor,
+          readBatched: async () => {
+            try {
+              return await agent.readBatchedWithStatus(runtime.owner, namespace)
+            } catch {
+              return null
+            }
+          },
           flushWaitMs: options?.flushWaitMs ?? FLUSH_WAIT_MS,
         })
-        skipped += batched.skipped.length
-        if (batched.partial) partial = true
-        const directCount = merged.length
-        merged.push(...batched.anchored)
-        merged.push(...batched.pending)
-        mergedBatched = merged.length > directCount
-      }
-    } else {
-      try {
-        const has = (await runtime.chain.publicClient.readContract({
-          address: batchAnchor,
-          abi: batchAnchorAbi,
-          functionName: "hasBatchedSaves",
-          args: [runtime.owner],
-        } as never)) as boolean
-        if (has) partial = true
-      } catch {
-        partial = true
-      }
+      : Promise.resolve(undefined),
+  ])
+  let partial = directPartial
+  let skipped = 0
+  const merged: ReadObject[] = [...objects]
+  let mergedBatched = false
+  if (batchedLane !== undefined) {
+    if (batchedLane.partial) partial = true
+    const batched = batchedLane.batched
+    if (batched !== undefined) {
+      skipped += batched.skipped.length
+      const directCount = merged.length
+      merged.push(...batched.anchored)
+      merged.push(...batched.pending)
+      mergedBatched = merged.length > directCount
     }
   }
   // The same-second tie scan readCheckpoints runs: a second shared across the two lanes needs

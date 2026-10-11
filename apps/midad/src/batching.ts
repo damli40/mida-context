@@ -1,5 +1,6 @@
 import { privateKeyToAccount } from "viem/accounts"
 import type { ContextApiClient } from "@mida/api"
+import { batchAnchorAbi } from "@mida/chain"
 import type { Deployment } from "@mida/chain"
 import type { CreateContextInput } from "@mida/sdk"
 import { PERMISSION, PROVENANCE_POLICY, namespaceId } from "@mida/protocol"
@@ -445,6 +446,20 @@ export async function flushForeignPending<T extends { pending: { contextId: Hex;
   batched: T
   readBatched: () => Promise<T | null>
   flushWaitMs: number
+  /**
+   * IMP-1: an absolute time (ms since epoch) the wait must end before, e.g. the handoff's budget.
+   */
+  deadlineAt?: number
+  /**
+   * IMP-1: how long one re-read took last time, so no re-read starts that would end past the deadline.
+   */
+  rereadEstimateMs?: number
+  /**
+   * CHAIN-04 (Oct 5): which pending rows are worth waiting for. readCheckpoints passes "this
+   * project's" — another folder's save cannot change this handoff and used to cost every read
+   * the whole wait. Absent, every foreign pending row counts, as before.
+   */
+  counts?: (item: T["pending"][number]) => boolean
 }): Promise<T> {
   let batched = input.batched
   let myAgentId: Hex | undefined
@@ -454,19 +469,84 @@ export async function flushForeignPending<T extends { pending: { contextId: Hex;
     myAgentId = undefined
   }
   const foreign = batched.pending.filter(
-    (item) => myAgentId === undefined || item.authorAgentId.toLowerCase() !== myAgentId.toLowerCase(),
+    (item) =>
+      (myAgentId === undefined || item.authorAgentId.toLowerCase() !== myAgentId.toLowerCase()) &&
+      (input.counts === undefined || input.counts(item)),
   )
   if (foreign.length === 0 || input.enabled !== true) return batched
+  if (input.deadlineAt !== undefined && input.deadlineAt - Date.now() <= 0) return batched
   const client = batchClient(input.runtime.home, input.runtime.apiBaseUrl, input.deployment, input.agentName)
   await client?.flushBatch().catch(() => undefined)
   const waiting = new Set(foreign.map((item) => item.contextId))
-  const deadline = Date.now() + input.flushWaitMs
-  while (Date.now() < deadline && batched.pending.some((item) => waiting.has(item.contextId))) {
-    await new Promise((resolve) => setTimeout(resolve, Math.min(FLUSH_POLL_MS, deadline - Date.now())))
+  const deadline = Math.min(Date.now() + input.flushWaitMs, input.deadlineAt ?? Number.POSITIVE_INFINITY)
+  let rereadMs = input.rereadEstimateMs ?? 0
+  // IMP-1 (Oct 5): stop while one more re-read could still finish inside the deadline — a pending row
+  // that has not anchored yet still merges, marked PENDING_ANCHOR, so stopping early loses only the label
+  while (batched.pending.some((item) => waiting.has(item.contextId))) {
+    const remaining = deadline - Date.now()
+    if (remaining <= rereadMs) break
+    await new Promise((resolve) => setTimeout(resolve, Math.min(FLUSH_POLL_MS, remaining - rereadMs)))
+    if (deadline - Date.now() <= rereadMs) break
+    const started = Date.now()
     const again = await input.readBatched()
+    rereadMs = Date.now() - started
     if (again !== null) batched = again
   }
   return batched
+}
+
+/**
+ * The batched lane of a read, shared by readCheckpoints and readNamespaceObjects (CHAIN-04, Oct 5):
+ * both now start it while the direct lane is still reading, so a read waits for the slower lane,
+ * not for both in turn. What it decides is unchanged: where the store serves the batch table for
+ * THIS anchor, read it (null → partial) and run the flush-on-switch; where it does not, only the
+ * contract's hasBatchedSaves flag can say "nothing to miss" — true, or a read that fails, is partial.
+ */
+export async function readBatchedLane<T extends { pending: { contextId: Hex; authorAgentId: Hex }[]; partial: boolean; skipped: unknown[] }>(input: {
+  runtime: ServiceRuntime
+  agentName: string
+  deployment: Deployment
+  batchAnchor: Address
+  readBatched: () => Promise<T | null>
+  flushWaitMs: number
+  counts?: (item: T["pending"][number]) => boolean
+  /**
+   * IMP-1 (Oct 5): the caller's own deadline — the handoff's budget — bounds the flush wait's
+   * re-reads, so the wait ends inside it instead of using up whatever is left.
+   */
+  deadlineAt?: number
+}): Promise<{ partial: boolean; batched?: T }> {
+  const status = await batchStatusProbe(input.runtime.apiBaseUrl)
+  if (status !== null && typeof status.batchAnchor === "string" && status.batchAnchor.toLowerCase() === input.batchAnchor.toLowerCase()) {
+    const firstStarted = Date.now()
+    const first = await input.readBatched()
+    const firstReadMs = Date.now() - firstStarted
+    if (first === null) return { partial: true }
+    const batched = await flushForeignPending({
+      runtime: input.runtime,
+      agentName: input.agentName,
+      deployment: input.deployment,
+      enabled: status.enabled,
+      batched: first,
+      readBatched: input.readBatched,
+      flushWaitMs: input.flushWaitMs,
+      rereadEstimateMs: firstReadMs,
+      ...(input.deadlineAt === undefined ? {} : { deadlineAt: input.deadlineAt }),
+      ...(input.counts === undefined ? {} : { counts: input.counts }),
+    })
+    return { partial: batched.partial, batched }
+  }
+  try {
+    const has = (await input.runtime.chain.publicClient.readContract({
+      address: input.batchAnchor,
+      abi: batchAnchorAbi,
+      functionName: "hasBatchedSaves",
+      args: [input.runtime.owner],
+    } as never)) as boolean
+    return { partial: has }
+  } catch {
+    return { partial: true }
+  }
 }
 
 /**

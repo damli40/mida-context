@@ -18,6 +18,7 @@ import { FileAccessRequestStore } from "./request-store.js"
 import { listAgentNames, loadAgentIdentity, loadGrants, loadOrCreateOwnerSecrets, loadOwnerAddress, loadOwnerSecrets, loadOwnerStartBlock, saveOwnerStartBlock } from "./keys.js"
 import type { AgentIdentity } from "./keys.js"
 import { startPersistentApi } from "./api-server.js"
+import { BLOCK_TIMES_SAVE_EVERY_MS, loadBlockTimes, saveBlockTimes } from "./block-times.js"
 import { isWindows } from "./platform.js"
 
 export interface Network {
@@ -468,6 +469,7 @@ function buildAgent(
   progress?: (line: string) => void,
   reads?: ReadScope,
   epochKeys?: EpochKeyCache,
+  blockTimes?: Map<bigint, bigint>,
 ): MidaAgent {
   const signer = privateKeyToAccount(identity.signerPrivateKey)
   const chain = createWriteContext({ rpcUrl: network.rpcUrl, deployment: network.deployment, account: signer })
@@ -490,6 +492,7 @@ function buildAgent(
     requests: new FileAccessRequestStore(home, identity.name),
     grants: loadGrants(home, identity.name),
     ...(epochKeys === undefined ? {} : { epochKeyCache: epochKeys }),
+    ...(blockTimes === undefined ? {} : { blockTimeCache: blockTimes }),
   })
 }
 
@@ -574,6 +577,13 @@ export class ServiceRuntime {
    * wrap fetches were ~2 s of a ~5-6 s handoff read, every read. Memory only, never on disk.
    */
   #epochKeys: EpochKeyCache = new Map()
+  /**
+   * CHAIN-04 (Oct 5): block timestamps, kept for this runtime's life, shared with every agent it
+   * builds and every read scope it hands out, and saved to state/block-times.json so a restart is
+   * warm too. Public chain data that never changes. Loaded on first use.
+   */
+  #blockTimes?: Map<bigint, bigint>
+  #blockTimesSaved = { size: 0, last: undefined as bigint | undefined, at: 0 }
   readonly reader: RegistryReader
   /**
    * One plain line to the owner while a slow step runs — the `mida` command sets it to STDERR;
@@ -674,7 +684,42 @@ export class ServiceRuntime {
   agent(name: string): MidaAgent {
     const identity = loadAgentIdentity(this.home, name)
     if (identity === undefined) throw agentNotSetup(name)
-    return buildAgent(this.home, this.network, this.apiBaseUrl, identity, (line) => this.progress?.(line), this.#reads, this.#epochKeys)
+    return buildAgent(this.home, this.network, this.apiBaseUrl, identity, (line) => this.progress?.(line), this.#reads, this.#epochKeys, this.blockTimes())
+  }
+
+  /** The runtime's one block-time map (CHAIN-04), loaded from the home on first use. */
+  blockTimes(): Map<bigint, bigint> {
+    if (this.#blockTimes === undefined) {
+      const chainId = this.network?.deployment?.chainId
+      this.#blockTimes = chainId === undefined ? new Map() : loadBlockTimes(this.home, BigInt(chainId))
+      this.#blockTimesSaved = { size: this.#blockTimes.size, last: this.#lastBlockTimeKey(this.#blockTimes), at: 0 }
+    }
+    return this.#blockTimes
+  }
+
+  /** The map's newest key — with the size, it changes whenever the map gains or swaps an entry. */
+  #lastBlockTimeKey(map: Map<bigint, bigint>): bigint | undefined {
+    let last: bigint | undefined
+    for (const key of map.keys()) last = key
+    return last
+  }
+
+  /**
+   * Writes state/block-times.json when the map changed since the last write (MIN-2: a size AND
+   * newest-key signature, so a full map that swaps entries still counts) and the last write is at
+   * least BLOCK_TIMES_SAVE_EVERY_MS old — the first change is written at once. `force` skips the
+   * throttle (close). Returns whether it wrote. Never throws.
+   */
+  saveBlockTimesIfGrown(now: number = Date.now(), force = false): boolean {
+    const map = this.#blockTimes
+    const chainId = this.network?.deployment?.chainId
+    if (map === undefined || chainId === undefined) return false
+    const last = this.#lastBlockTimeKey(map)
+    if (map.size === this.#blockTimesSaved.size && last === this.#blockTimesSaved.last) return false
+    if (!force && now - this.#blockTimesSaved.at < BLOCK_TIMES_SAVE_EVERY_MS) return false
+    saveBlockTimes(this.home, BigInt(chainId), map)
+    this.#blockTimesSaved = { size: map.size, last, at: now }
+    return true
   }
 
   /**
@@ -702,11 +747,13 @@ export class ServiceRuntime {
     )
     scoped.#reads = scope
     scoped.#epochKeys = this.#epochKeys // the scoped facade shares the real runtime's keys
+    scoped.#blockTimes = this.blockTimes() // the scoped facade shares the real runtime's block times
     scoped.progress = this.progress
     return scoped
   }
 
   close(): Promise<void> {
+    this.saveBlockTimesIfGrown(Date.now(), true) // MIN-2: what the throttle held back is not lost on shutdown
     return this.#close()
   }
 }

@@ -273,18 +273,37 @@ interface DecodedLogForPlacement {
   transactionIndex: number | null
 }
 
+/** Bound on block times a long-lived map keeps; the oldest goes first (CHAIN-04). */
+export const BLOCK_TIME_CACHE_MAX = 20_000
+
 /**
  * One `getBlock` per distinct block, shared across a whole call — a read that anchors many saves
  * out of a handful of blocks asks once each. The in-flight promise is cached so concurrent
- * callers share the request (and one another's failure).
+ * callers share the request (and one another's failure). CHAIN-04 (Oct 5): `known`, when given,
+ * outlives the call. A block's timestamp never changes, so a long-lived service passes one map to
+ * every read and each batched row's block is asked about once for the life of the service — on
+ * the demo home every batch held one save, and a handoff asked Monad 43 times, every time. Only a
+ * timestamp that really arrived is kept there; a failed fetch never is.
  */
-export function blockTimeCache(client: BlockClient): (block: bigint) => Promise<bigint> {
+export function blockTimeCache(client: BlockClient, known?: Map<bigint, bigint>): (block: bigint) => Promise<bigint> {
   const cache = new Map<bigint, Promise<bigint>>()
   return (block) => {
+    const kept = known?.get(block)
+    if (kept !== undefined) return Promise.resolve(kept)
     let cached = cache.get(block)
     if (cached === undefined) {
       cached = client.getBlock({ blockNumber: block }).then((b) => b.timestamp)
       cache.set(block, cached)
+      if (known !== undefined) {
+        cached.then(
+          (timestamp) => {
+            if (timestamp <= 0n) return // MIN-3: a chain's block time is never zero; never keep one
+            if (!known.has(block) && known.size >= BLOCK_TIME_CACHE_MAX) known.delete(known.keys().next().value!)
+            known.set(block, timestamp)
+          },
+          () => {},
+        )
+      }
     }
     return cached
   }

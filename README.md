@@ -243,7 +243,7 @@ You need pnpm (`npm install -g pnpm`).
 ```bash
 git clone --recurse-submodules https://github.com/damli40/mida-context && cd mida-context
 pnpm install && pnpm build:publish
-cd publish/cli && npm pack && npm install -g mida-context-0.1.4.tgz
+cd publish/cli && npm pack && npm install -g mida-context-0.1.5.tgz
 ```
 
 Windows PowerShell does not accept `&&`, so there it is one command per line:
@@ -255,7 +255,7 @@ pnpm install
 pnpm build:publish
 cd publish/cli
 npm pack
-npm install -g mida-context-0.1.4.tgz
+npm install -g mida-context-0.1.5.tgz
 ```
 
 </details>

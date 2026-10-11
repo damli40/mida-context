@@ -98,9 +98,9 @@ function deps(over: Partial<HandoffDeps> = {}) {
       calls.capability += 1
       return (over.capability ?? (async () => "live" as const))(r, a)
     },
-    read: async (r, n, p) => {
+    read: async (r, n, p, o) => {
       calls.read += 1
-      return (over.read ?? (async () => ({ checkpoints: [], skipped: 0, milliseconds: 1, partial: false })))(r, n, p)
+      return (over.read ?? (async () => ({ checkpoints: [], skipped: 0, milliseconds: 1, partial: false })))(r, n, p, o)
     },
     readFacts: async (r, n) => {
       calls.readFacts += 1
@@ -375,6 +375,8 @@ describe("buildHandoff", () => {
     expect(result).toEqual({
       kind: "refused",
       reason: "read-failed",
+      // CHAIN-13: a code-less error names its class for the log — the agent's text is unchanged
+      errorCode: "Error",
       text: "Mida: no context available right now (read-failed).",
     })
   })
@@ -2095,5 +2097,57 @@ describe("queued saves surface in the handoff (in-8 H4)", () => {
       if (result.kind !== "handoff") return
       expect(result.text).toContain("(its newest change is under a minute old); this record may be behind it.")
     }
+  })
+})
+
+describe("buildHandoff — CHAIN-04/CHAIN-13 (Oct 5): one budget for the whole handoff, and a failed read names its error", () => {
+  it("a read that throws refuses read-failed with the error's code for the log, and the same text for the agent", async () => {
+    const { d } = deps({
+      read: async () => {
+        throw Object.assign(new Error("the store said no for 0xabc"), { code: "STORE_DOWN" })
+      },
+    })
+    const result = await buildHandoff(runtime, input, d)
+    expect(result).toMatchObject({ kind: "refused", reason: "read-failed", errorCode: "STORE_DOWN" })
+    expect(result.text).not.toContain("STORE_DOWN")
+    expect(result.text).not.toContain("the store said no")
+  })
+
+  it("logs only a Mida-shaped code, else the class name, plus a network cause's code (MIN-4)", async () => {
+    const thrown = async (error: unknown) => buildHandoff(runtime, input, deps({ read: async () => { throw error } }).d)
+    expect(await thrown(new TypeError("boom"))).toMatchObject({ reason: "read-failed", errorCode: "TypeError" })
+    expect(await thrown(Object.assign(new Error("x"), { code: "0xabcdef1234 store chose this" }))).toMatchObject({ errorCode: "Error" })
+    expect(await thrown(Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNREFUSED" } }))).toMatchObject({ errorCode: "TypeError:ECONNREFUSED" })
+    expect(await thrown(Object.assign(new Error("x"), { code: "CAPABILITY_DENIED_X" }))).toMatchObject({ errorCode: "CAPABILITY_DENIED_X" })
+  })
+
+  it("a slow access check leaves the read only what remains of the budget", async () => {
+    const { d } = deps({
+      limitMs: 400,
+      checkProject: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 250))
+        return OK
+      },
+      read: () => new Promise(() => {}),
+    })
+    const began = Date.now()
+    const result = await buildHandoff(runtime, input, d)
+    expect(result).toMatchObject({ kind: "refused", reason: "read-slow" })
+    expect(Date.now() - began).toBeLessThan(550) // was 250 for the check + 400 for the read
+  })
+
+  it("hands the read a deadline inside the handoff's budget (IMP-1)", async () => {
+    let seen: { deadlineAt?: number } | undefined
+    const { d } = deps({
+      limitMs: 2_000,
+      read: async (_r, _n, _p, options) => {
+        seen = options
+        return { checkpoints: [], skipped: 0, milliseconds: 1, partial: false }
+      },
+    })
+    const began = Date.now()
+    await buildHandoff(runtime, input, d)
+    expect(seen?.deadlineAt).toBeGreaterThan(began)
+    expect(seen!.deadlineAt!).toBeLessThanOrEqual(began + 2_000 - 750)
   })
 })
