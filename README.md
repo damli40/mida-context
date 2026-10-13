@@ -31,107 +31,22 @@
 
 ---
 
-## The problem
+**Mida is the context layer for AI.** Coding-agent continuity is the first working use case.
 
-Right now you are the API between your AI tools: when you switch, you carry the context across by
-hand. One agent runs out of usage, crashes, or you want a different one for the next part of the
-job. The new agent starts blind. What you asked for, what the first agent
-decided and why, what it tried and dropped, what is left: all of it stays inside the first tool.
+[Watch the demo](#see-it-work) · [Quickstart](#quickstart) · [Security and limits](#security-model-and-limits)
 
-We measured what "blind" costs. Claude Code started a five-step job and was cut off after the
-first step. A fresh Codex session in the same folder got one word, "Continue." Handed nothing, it
-finished **0 of 5** runs. In all five its tests passed and it stopped there, because it never
-learned that the other four steps existed. Handed a Mida handoff, it finished **5 of 5**.
-A second scorer checked all fifteen runs without knowing which was which, and agreed.
+## See it work
 
-Pasting the first session's whole transcript also finished 5 of 5. Those sessions were under two
-minutes long, so the transcript fit. Mida does that step for you, in every tool. A long session
-no longer fits in a paste, and this benchmark has not tested one yet
-([method and every run](docs/evidence/continuation-benchmark-2026-10-02.md)).
+**One word: `Continue.`** In this recorded run, the plan changes in Claude Code's chat. Claude stops;
+a fresh Codex session receives the Mida handoff, names the change, and builds it.
 
-A paste is also frozen at the moment you make it. In a second benchmark the owner changed one
-decision in another agent's session after Codex had started work, and nothing on disk recorded
-it. With Mida, Codex applied the change in **5 of 5** runs when its session resumed. Without
-Mida the change never reached it, in 10 of 10 runs
-([method and every run](docs/evidence/late-change-benchmark-2026-10-02.md)).
+[![Watch the real Claude Code → Codex handoff: Mida loads Claude's checkpoints into a fresh Codex session. Animated excerpt. Click to open the 83-second captioned video.](docs/assets/continue-preview.gif)](docs/assets/continue-demo.mp4)
 
-Today you paste transcripts or keep a notes file. That file belongs to no one, any program on your
-machine can read it, and you cannot take it back from an agent you stop trusting. The tools also
-change every few weeks. Your context should not be the reason you stay with one of them.
+[**▶ Watch the demo — 83 seconds, captioned, no audio**](docs/assets/continue-demo.mp4)
 
-> [!IMPORTANT]
-> **Pre-release. Monad testnet only. Not audited.** The full loop ran live on Monad testnet on
-> Sep 27, 2026: Claude Code to Codex and back, Devin, Claude Desktop, and a revoke that cut an agent
-> off mid-project ([what ran](docs/evidence/live-tests-2026-09-27-to-29.md)). See
-> [What works and what doesn't](#what-works-and-what-doesnt) before you rely on it.
-
-## What Mida does
-
-Mida is a small service on your machine plus a set of permission rules on a public blockchain
-(Monad testnet).
-
-- **It captures.** Hooks in your agent tell the service what the session is doing.
-- **It summarises.** A model you choose turns the session into a **checkpoint**: your original
-  request word for word, the goal, progress, decisions with reasons, rejected approaches,
-  constraints, and the next step. A message you typed mid-session counts as yours, and a later
-  instruction from you overrides the first one.
-- **It encrypts on your machine.** The store only ever holds ciphertext.
-- **It records permissions and authorship on Monad.** The chain says which agent may read which
-  kind of context and which agent wrote each record. Content never goes on chain.
-- **It hands off.** When an approved agent starts a session, Mida prints the latest checkpoint into
-  it. You type "Continue." Mid-session, the agent can ask Mida again through its MCP tools.
-- **You decide.** Only you approve or revoke an agent, from your own terminal. An agent cannot
-  approve itself.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/architecture/mida-architecture-dark.svg">
-  <img alt="How work passes from one agent to the next. An agent such as Claude Code, Codex or Devin works, and Mida, running on your machine, receives what happens in the session. A model you choose (your agents' own small models, or your own API key) writes a short summary of what was decided and what is left to do; secrets are removed first. Mida locks the summary on your machine and sends out two things: the locked copy to a store that holds it but cannot read it, and a fingerprint plus who wrote it to the Monad blockchain, where a gas sponsor pays the fee by default. When the next agent starts, Mida checks on Monad that you approved it, fetches the locked copy, unlocks it on your machine and hands the summary to the agent, which continues the work. Only you approve or revoke an agent, from your terminal or a passkey page, and that decision is recorded on Monad. If a save cannot go out yet, it waits on your machine, Mida retries it, and the next agent is told." src="docs/architecture/mida-architecture-light.svg" width="100%">
-</picture>
-
-## Who builds on Mida
-
-Mida is a primitive for developers. Three kinds of software need what it provides:
-
-- **Agents that hand work to other agents.** A planner hands to a coder, one vendor's agent hands to
-  another's, a crashed session hands to a fresh one. They need the work to survive the switch.
-- **Apps that act for a person.** Assistants, coding agents and MCP clients need the context the
-  person approved, and only that.
-- **Multi-agent systems that must show who did what.** Agent marketplaces, audit trails and agent
-  registries need a record of which agent wrote or decided each thing that anyone can check.
-
-Building this yourself means per-agent keys and encryption, a permission list the user controls and
-can revoke, provenance someone else can verify, a handoff format, and an export so users can leave.
-Teams keep rebuilding a slice of it by hand. The SDK gives you all of it in a few calls:
-
-```ts
-import { Mida } from "@mida-context/sdk"
-
-const mida = new Mida({ agent: "my-agent" })
-const { items } = await mida.context({ namespace: "projects.current", limit: 8192 })
-await mida.remember({ namespace: "projects.current", content: { note: "user prefers pnpm" } })
-```
-
-The user registers your agent once with `mida add-agent my-agent`, and approves it with `mida approve my-agent`. Everything the SDK reads passes the
-grants the user signed; your app never holds the user's owner keys. Full reference:
-[`docs/sdk.md`](docs/sdk.md).
-
----
-
-## Contents
-
-- [Quickstart](#quickstart)
-- [Supported agents](#supported-agents)
-- [How it works](#how-it-works)
-- [Commands](#commands)
-- [Who writes the summaries](#who-writes-the-summaries)
-- [Remove Mida](#remove-mida)
-- [Security model and limits](#security-model-and-limits)
-- [What it costs to run](#what-it-costs-to-run)
-- [What works and what doesn't](#what-works-and-what-doesnt)
-- [Benchmarks](#benchmarks)
-- [How it scales](#how-it-scales)
-- [Where Mida is going](#where-mida-is-going)
-- [Repository layout](#repository-layout)
+The preview is a 20-second excerpt; the full film reuses the existing October 5 recording and
+October 6 captioned edit. Some waits are sped up;
+the memory-world data shown in the demo is illustrative. The agent handoff is real.
 
 ---
 
@@ -259,6 +174,120 @@ npm install -g mida-context-0.1.5.tgz
 ```
 
 </details>
+
+---
+
+## Context, under your control
+
+![Claude Code saves a checkpoint through Mida. Context is encrypted on your machine; you approve or revoke access. A fresh Codex session receives the approved handoff and continues. Separately, Monad testnet records permissions, revocations, authors and record fingerprints, never context content.](docs/architecture/readme-handoff.svg)
+
+The handoff carries context. Monad testnet records who has authority and where each record came from.
+
+---
+
+## The problem
+
+Right now you are the API between your AI tools: when you switch, you carry the context across by
+hand. One agent runs out of usage, crashes, or you want a different one for the next part of the
+job. The new agent starts blind. What you asked for, what the first agent
+decided and why, what it tried and dropped, what is left: all of it stays inside the first tool.
+
+We measured what "blind" costs. Claude Code started a five-step job and was cut off after the
+first step. A fresh Codex session in the same folder got one word, "Continue." Handed nothing, it
+finished **0 of 5** runs. In all five its tests passed and it stopped there, because it never
+learned that the other four steps existed. Handed a Mida handoff, it finished **5 of 5**.
+A second scorer checked all fifteen runs without knowing which was which, and agreed.
+
+Pasting the first session's whole transcript also finished 5 of 5. Those sessions were under two
+minutes long, so the transcript fit. Mida does that step for you, in every tool. A long session
+no longer fits in a paste, and this benchmark has not tested one yet
+([method and every run](docs/evidence/continuation-benchmark-2026-10-02.md)).
+
+A paste is also frozen at the moment you make it. In a second benchmark the owner changed one
+decision in another agent's session after Codex had started work, and nothing on disk recorded
+it. With Mida, Codex applied the change in **5 of 5** runs when its session resumed. Without
+Mida the change never reached it, in 10 of 10 runs
+([method and every run](docs/evidence/late-change-benchmark-2026-10-02.md)).
+
+Today you paste transcripts or keep a notes file. That file belongs to no one, any program on your
+machine can read it, and you cannot take it back from an agent you stop trusting. The tools also
+change every few weeks. Your context should not be the reason you stay with one of them.
+
+> [!IMPORTANT]
+> **Pre-release. Monad testnet only. Not audited.** The full loop ran live on Monad testnet on
+> Sep 27, 2026: Claude Code to Codex and back, Devin, Claude Desktop, and a revoke that cut an agent
+> off mid-project ([what ran](docs/evidence/live-tests-2026-09-27-to-29.md)). See
+> [What works and what doesn't](#what-works-and-what-doesnt) before you rely on it.
+
+## What Mida does
+
+Mida is a small service on your machine plus a set of permission rules on a public blockchain
+(Monad testnet).
+
+- **It captures.** Hooks in your agent tell the service what the session is doing.
+- **It summarises.** A model you choose turns the session into a **checkpoint**: your original
+  request word for word, the goal, progress, decisions with reasons, rejected approaches,
+  constraints, and the next step. A message you typed mid-session counts as yours, and a later
+  instruction from you overrides the first one.
+- **It encrypts on your machine.** The store only ever holds ciphertext.
+- **It records permissions and authorship on Monad.** The chain says which agent may read which
+  kind of context and which agent wrote each record. Content never goes on chain.
+- **It hands off.** When an approved agent starts a session, Mida prints the latest checkpoint into
+  it. You type "Continue." Mid-session, the agent can ask Mida again through its MCP tools.
+- **You decide.** Only you approve or revoke an agent, from your own terminal. An agent cannot
+  approve itself.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/architecture/mida-architecture-dark.svg">
+  <img alt="How work passes from one agent to the next. An agent such as Claude Code, Codex or Devin works, and Mida, running on your machine, receives what happens in the session. A model you choose (your agents' own small models, or your own API key) writes a short summary of what was decided and what is left to do; secrets are removed first. Mida locks the summary on your machine and sends out two things: the locked copy to a store that holds it but cannot read it, and a fingerprint plus who wrote it to the Monad blockchain, where a gas sponsor pays the fee by default. When the next agent starts, Mida checks on Monad that you approved it, fetches the locked copy, unlocks it on your machine and hands the summary to the agent, which continues the work. Only you approve or revoke an agent, from your terminal or a passkey page, and that decision is recorded on Monad. If a save cannot go out yet, it waits on your machine, Mida retries it, and the next agent is told." src="docs/architecture/mida-architecture-light.svg" width="100%">
+</picture>
+
+## Who builds on Mida
+
+Mida is a primitive for developers. Three kinds of software need what it provides:
+
+- **Agents that hand work to other agents.** A planner hands to a coder, one vendor's agent hands to
+  another's, a crashed session hands to a fresh one. They need the work to survive the switch.
+- **Apps that act for a person.** Assistants, coding agents and MCP clients need the context the
+  person approved, and only that.
+- **Multi-agent systems that must show who did what.** Agent marketplaces, audit trails and agent
+  registries need a record of which agent wrote or decided each thing that anyone can check.
+
+Building this yourself means per-agent keys and encryption, a permission list the user controls and
+can revoke, provenance someone else can verify, a handoff format, and an export so users can leave.
+Teams keep rebuilding a slice of it by hand. The SDK gives you all of it in a few calls:
+
+```ts
+import { Mida } from "@mida-context/sdk"
+
+const mida = new Mida({ agent: "my-agent" })
+const { items } = await mida.context({ namespace: "projects.current", limit: 8192 })
+await mida.remember({ namespace: "projects.current", content: { note: "user prefers pnpm" } })
+```
+
+The user registers your agent once with `mida add-agent my-agent`, and approves it with `mida approve my-agent`. Everything the SDK reads passes the
+grants the user signed; your app never holds the user's owner keys. Full reference:
+[`docs/sdk.md`](docs/sdk.md).
+
+---
+
+## Contents
+
+- [Quickstart](#quickstart)
+- [Supported agents](#supported-agents)
+- [How it works](#how-it-works)
+- [Commands](#commands)
+- [Who writes the summaries](#who-writes-the-summaries)
+- [Remove Mida](#remove-mida)
+- [Security model and limits](#security-model-and-limits)
+- [What it costs to run](#what-it-costs-to-run)
+- [What works and what doesn't](#what-works-and-what-doesnt)
+- [Benchmarks](#benchmarks)
+- [How it scales](#how-it-scales)
+- [Where Mida is going](#where-mida-is-going)
+- [Repository layout](#repository-layout)
+
+---
 
 ## Supported agents
 
