@@ -8,32 +8,28 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Monad-testnet%2010143-836EF9?style=flat-square&labelColor=14130F" alt="Monad testnet, chain 10143">
   <img src="https://img.shields.io/badge/status-pre--release-b08800?style=flat-square&labelColor=14130F" alt="Pre-release">
-  <img src="https://img.shields.io/badge/tests-3%2C998%20passing-2f9e44?style=flat-square&labelColor=14130F" alt="3,998 tests passing">
+  <a href="docs/evidence/readme-test-verification-2026-10-13.md"><img src="https://img.shields.io/badge/tests-4%2C019%20passing-2f9e44?style=flat-square&labelColor=14130F" alt="4,019 tests passing; 1 skipped. Verified October 13, 2026."></a>
   <img src="https://img.shields.io/badge/audit-none-7e8c86?style=flat-square&labelColor=14130F" alt="Not audited">
   <img src="https://img.shields.io/badge/license-MIT-7e8c86?style=flat-square&labelColor=14130F" alt="MIT license">
 </p>
 
 <p align="center">
-  <b>Switch AI coding agents without starting over.</b> Mida Context is a user-owned context layer
-  for AI agents: encrypted under your keys, read only by agents you approve and can revoke on Monad.
-  It keeps what you tell it about yourself and what your agents learn about your work. The first thing
-  it proves is the hardest: one coding agent finishes the job another one started, with your
-  decisions, preferences, last-minute changes and style rules carried over.
+  <b>Mida is the context layer for AI.</b> Your context stays encrypted under your keys,
+  accessible to agents you approve and can revoke on Monad. Coding-agent continuity is the first
+  working use case: start in Claude Code and let a fresh Codex session continue with your
+  decisions, constraints, and next steps.
 </p>
 
 <p align="center">
   <a href="https://app.midacontext.xyz"><b>Owner page</b></a> &nbsp;·&nbsp;
-  <a href="docs/quickstart.md">Full walkthrough</a> &nbsp;·&nbsp;
+  <a href="#see-it-work">Watch the demo</a> &nbsp;·&nbsp;
+  <a href="#quickstart">Quickstart</a> &nbsp;·&nbsp;
   <a href="docs/use-cases.md">Use cases</a> &nbsp;·&nbsp;
   <a href="docs/evidence">Evidence</a> &nbsp;·&nbsp;
-  <a href="#quickstart">Run it yourself</a>
+  <a href="#security-model-and-limits">Security and limits</a>
 </p>
 
 ---
-
-**Mida is the context layer for AI.** Coding-agent continuity is the first working use case.
-
-[Watch the demo](#see-it-work) · [Quickstart](#quickstart) · [Security and limits](#security-model-and-limits)
 
 ## See it work
 
@@ -622,7 +618,8 @@ Mida agent saved. ASSAY merged our half into their repository on Oct 8
 
 <img alt="How Mida and ASSAY work together. 1, ask: a small Mida program sends one prompt to ASSAY's host, a model server on Monad testnet, which answers and signs a receipt: which model, which host, and a sealed fingerprint of the prompt and the answer; 2, ASSAY anchors the receipt on Monad in its ReceiptAnchor contract, about every 30 seconds; 3, write: a Mida agent the owner approved runs ASSAY's check, then saves the receipt and its opening key inside one encrypted Mida record, kept off-chain, and Monad records which agent wrote it; 4, read: a second approved Mida agent reads the record, runs ASSAY's check again, including the anchor on Monad, and only then uses the answer; 5, revoke: the owner revokes the reader, its next read is refused, and the receipt stays valid. ASSAY proves which model and host produced a response; Mida proves which agent saved what, for whom, and who may read it. Monad testnet. Mida is not audited. ASSAY's team cannot read the Mida record." src="docs/architecture/mida-assay.png" width="100%">
 
-3,998 automated tests pass on this release: `pnpm test`.
+4,019 automated tests passed, with 0 failures and 1 skipped, in the October 13, 2026 check of
+`pnpm test` ([verification](docs/evidence/readme-test-verification-2026-10-13.md)).
 
 ---
 
